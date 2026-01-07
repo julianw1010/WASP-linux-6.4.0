@@ -294,4 +294,11 @@ struct prctl_mm_map {
 
 #define PR_SET_MEMORY_MERGE		67
 #define PR_GET_MEMORY_MERGE		68
+
+/* PGD replication control */
+#define PR_SET_PGTABLE_REPL		100
+#define PR_GET_PGTABLE_REPL		101
+#define PR_SET_PGTABLE_REPL_STEERING	104
+#define PR_GET_PGTABLE_REPL_STEERING	105
+
 #endif /* _LINUX_PRCTL_H */

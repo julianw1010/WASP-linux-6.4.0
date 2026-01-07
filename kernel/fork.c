@@ -111,6 +111,11 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/task.h>
 
+#ifdef CONFIG_PGTABLE_REPLICATION
+#include <asm/pgtable_repl.h>
+#include <linux/mitosis_stats.h>
+#endif
+
 /*
  * Minimum number of threads to boot the kernel
  */
@@ -1256,7 +1261,6 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	struct user_namespace *user_ns)
 {
 	int i;
-
 	mt_init_flags(&mm->mm_mt, MM_MT_FLAGS);
 	mt_set_external_lock(&mm->mm_mt, &mm->mmap_lock);
 	atomic_set(&mm->mm_users, 1);
@@ -1286,7 +1290,6 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 #endif
 	mm_init_uprobes_state(mm);
 	hugetlb_count_init(mm);
-
 	if (current->mm) {
 		mm->flags = current->mm->flags & MMF_INIT_MASK;
 		mm->def_flags = current->mm->def_flags & VM_INIT_DEF_MASK;
@@ -1295,21 +1298,64 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 		mm->def_flags = 0;
 	}
 
+#ifdef CONFIG_PGTABLE_REPLICATION
+	mm->repl_pgd_enabled = false;
+	mm->repl_in_progress = false;
+	mm->repl_pending_enable = false;
+	nodes_clear(mm->repl_pgd_nodes);
+	nodes_clear(mm->repl_pending_nodes);
+	mutex_init(&mm->repl_mutex);
+	spin_lock_init(&mm->repl_alloc_lock);
+	memset(mm->pgd_replicas, 0, sizeof(mm->pgd_replicas));
+	mm->original_pgd = NULL;
+	/* Initialize steering matrix to auto mode (-1 = use local node) */
+	for (int i = 0; i < NUMA_NODE_COUNT; i++) {
+		mm->repl_steering[i] = -1;
+		atomic_set(&mm->pgtable_alloc_pte[i], 0);
+		atomic_set(&mm->pgtable_alloc_pmd[i], 0);
+		atomic_set(&mm->pgtable_alloc_pud[i], 0);
+		atomic_set(&mm->pgtable_alloc_p4d[i], 0);
+		atomic_set(&mm->pgtable_alloc_pgd[i], 0);
+		atomic_set(&mm->pgtable_max_pte[i], 0);
+		atomic_set(&mm->pgtable_max_pmd[i], 0);
+		atomic_set(&mm->pgtable_max_pud[i], 0);
+		atomic_set(&mm->pgtable_max_p4d[i], 0);
+		atomic_set(&mm->pgtable_max_pgd[i], 0);
+	}
+	/* Initialize statistics fields */
+	atomic64_set(&mm->mitosis_tlb_shootdowns, 0);
+	atomic64_set(&mm->mitosis_tlb_ipis_sent, 0);
+	for (int i = 0; i < NUMA_NODE_COUNT; i++) {
+		atomic64_set(&mm->mitosis_pgd_replicas[i], 0);
+		atomic64_set(&mm->mitosis_p4d_replicas[i], 0);
+		atomic64_set(&mm->mitosis_pud_replicas[i], 0);
+		atomic64_set(&mm->mitosis_pmd_replicas[i], 0);
+		atomic64_set(&mm->mitosis_pte_replicas[i], 0);
+		atomic64_set(&mm->mitosis_max_pgd_replicas[i], 0);
+		atomic64_set(&mm->mitosis_max_p4d_replicas[i], 0);
+		atomic64_set(&mm->mitosis_max_pud_replicas[i], 0);
+		atomic64_set(&mm->mitosis_max_pmd_replicas[i], 0);
+		atomic64_set(&mm->mitosis_max_pte_replicas[i], 0);
+	}
+	mm->mitosis_repl_start_time = 0;
+	mm->mitosis_owner_pid = 0;
+	mm->mitosis_owner_tgid = 0;
+	mm->mitosis_owner_comm[0] = '\0';
+	mm->mitosis_cmdline[0] = '\0';
+#endif
+
 	if (mm_alloc_pgd(mm))
 		goto fail_nopgd;
-
 	if (init_new_context(p, mm))
 		goto fail_nocontext;
-
 	if (mm_alloc_cid(mm))
 		goto fail_cid;
-
 	for (i = 0; i < NR_MM_COUNTERS; i++)
 		if (percpu_counter_init(&mm->rss_stat[i], 0, GFP_KERNEL_ACCOUNT))
 			goto fail_pcpu;
-
 	mm->user_ns = get_user_ns(user_ns);
 	lru_gen_init_mm(mm);
+	
 	return mm;
 
 fail_pcpu:
@@ -1369,8 +1415,18 @@ void mmput(struct mm_struct *mm)
 {
 	might_sleep();
 
-	if (atomic_dec_and_test(&mm->mm_users))
+	if (atomic_dec_and_test(&mm->mm_users)) {
+#ifdef CONFIG_PGTABLE_REPLICATION
+		if (mm->repl_pgd_enabled) {
+			WARN_ON_ONCE(atomic_read(&mm->mm_users) != 0);
+			synchronize_rcu();
+			pgtable_repl_disable(mm);
+			WARN_ON_ONCE(mm->repl_pgd_enabled);
+			WARN_ON_ONCE(!nodes_empty(mm->repl_pgd_nodes));
+		}
+#endif
 		__mmput(mm);
+	}
 }
 EXPORT_SYMBOL_GPL(mmput);
 
@@ -1686,6 +1742,38 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
 
 	memcpy(mm, oldmm, sizeof(*mm));
 
+#ifdef CONFIG_PGTABLE_REPLICATION
+	/* New mm starts with clean replication state */
+	mm->repl_pgd_enabled = false;
+	mm->repl_in_progress = false;
+	mm->repl_pending_enable = false;
+	nodes_clear(mm->repl_pgd_nodes);
+	nodes_clear(mm->repl_pending_nodes);
+	mutex_init(&mm->repl_mutex);
+	spin_lock_init(&mm->repl_alloc_lock);
+	memset(mm->pgd_replicas, 0, sizeof(mm->pgd_replicas));
+	mm->original_pgd = NULL;
+	
+	/* Initialize steering matrix to auto mode (-1 = use local node) */
+	for (int i = 0; i < NUMA_NODE_COUNT; i++) {
+		mm->repl_steering[i] = -1;
+		atomic_set(&mm->pgtable_alloc_pte[i], 0);
+		atomic_set(&mm->pgtable_alloc_pmd[i], 0);
+		atomic_set(&mm->pgtable_alloc_pud[i], 0);
+		atomic_set(&mm->pgtable_alloc_p4d[i], 0);
+		atomic_set(&mm->pgtable_alloc_pgd[i], 0);
+		atomic_set(&mm->pgtable_max_pte[i], 0);
+		atomic_set(&mm->pgtable_max_pmd[i], 0);
+		atomic_set(&mm->pgtable_max_pud[i], 0);
+		atomic_set(&mm->pgtable_max_p4d[i], 0);
+		atomic_set(&mm->pgtable_max_pgd[i], 0);
+	}
+
+	/* Verify new mm has clean state after initialization */
+	WARN_ON_ONCE(mm->repl_pgd_enabled);
+	WARN_ON_ONCE(!nodes_empty(mm->repl_pgd_nodes));
+#endif
+
 	if (!mm_init(mm, tsk, mm->user_ns))
 		goto fail_nomem;
 
@@ -1738,9 +1826,63 @@ static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)
 		mmget(oldmm);
 		mm = oldmm;
 	} else {
-		mm = dup_mm(tsk, current->mm);
+#ifdef CONFIG_PGTABLE_REPLICATION
+		bool parent_had_mitosis = false;
+		nodemask_t saved_nodes;
+		int ret;
+
+		nodes_clear(saved_nodes);
+
+		/*
+		 * Snapshot mitosis state atomically under mutex.
+		 * This prevents seeing enabled=true with empty nodes.
+		 */
+		mutex_lock(&oldmm->repl_mutex);
+		if (oldmm->repl_pgd_enabled &&
+		    !nodes_empty(oldmm->repl_pgd_nodes) &&
+		    nodes_weight(oldmm->repl_pgd_nodes) >= 2) {
+			parent_had_mitosis = true;
+			saved_nodes = oldmm->repl_pgd_nodes;
+		}
+		mutex_unlock(&oldmm->repl_mutex);
+
+		/*
+		 * Disable parent's mitosis before dup_mm.
+		 * This simplifies page table copying.
+		 */
+		if (parent_had_mitosis) {
+			pgtable_repl_disable(oldmm);
+		}
+
+		mm = dup_mm(tsk, oldmm);
+
+		if (!mm) {
+			/* Best-effort restore on OOM */
+			if (parent_had_mitosis) {
+				pgtable_repl_enable(oldmm, saved_nodes);
+			}
+			return -ENOMEM;
+		}
+
+		/* Restore parent's mitosis */
+		if (parent_had_mitosis) {
+			ret = pgtable_repl_enable(oldmm, saved_nodes);
+			/* -EALREADY means another thread re-enabled - fine */
+		}
+
+		/* Enable child's mitosis if configured */
+		if (sysctl_mitosis_inherit == 1 && parent_had_mitosis) {
+			pgtable_repl_enable(mm, saved_nodes);
+		} else if (sysctl_mitosis_auto_enable == 1 &&
+			   !(tsk->flags & PF_KTHREAD) &&
+			   num_online_nodes() >= 2) {
+			pgtable_repl_enable(mm, node_online_map);
+		}
+#else
+		mm = dup_mm(tsk, oldmm);
 		if (!mm)
 			return -ENOMEM;
+#endif
 	}
 
 	tsk->mm = mm;

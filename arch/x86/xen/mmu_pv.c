@@ -1482,13 +1482,13 @@ static void __init xen_alloc_pmd_init(struct mm_struct *mm, unsigned long pfn)
 
 /* Early release_pte assumes that all pts are pinned, since there's
    only init_mm and anything attached to that is pinned. */
-static void __init xen_release_pte_init(unsigned long pfn)
+static void __init xen_release_pte_init(struct mm_struct *mm, unsigned long pfn)
 {
 	pin_pagetable_pfn(MMUEXT_UNPIN_TABLE, pfn);
 	make_lowmem_page_readwrite(__va(PFN_PHYS(pfn)));
 }
 
-static void __init xen_release_pmd_init(unsigned long pfn)
+static void __init xen_release_pmd_init(struct mm_struct *mm, unsigned long pfn)
 {
 	make_lowmem_page_readwrite(__va(PFN_PHYS(pfn)));
 }
@@ -1577,12 +1577,11 @@ static inline void xen_release_ptpage(unsigned long pfn, unsigned level)
 	}
 }
 
-static void xen_release_pte(unsigned long pfn)
+static void xen_release_pte(struct mm_struct *mm, unsigned long pfn)
 {
 	xen_release_ptpage(pfn, PT_PTE);
 }
-
-static void xen_release_pmd(unsigned long pfn)
+static void xen_release_pmd(struct mm_struct *mm, unsigned long pfn)
 {
 	xen_release_ptpage(pfn, PT_PMD);
 }
@@ -1592,7 +1591,7 @@ static void xen_alloc_pud(struct mm_struct *mm, unsigned long pfn)
 	xen_alloc_ptpage(mm, pfn, PT_PUD);
 }
 
-static void xen_release_pud(unsigned long pfn)
+static void xen_release_pud(struct mm_struct *mm, unsigned long pfn)
 {
 	xen_release_ptpage(pfn, PT_PUD);
 }

@@ -23,6 +23,7 @@
 #include <asm/coco.h>
 #include <asm-generic/pgtable_uffd.h>
 #include <linux/page_table_check.h>
+#include <asm/pgtable_repl.h>
 
 extern pgd_t early_top_pgt[PTRS_PER_PGD];
 bool __init __early_make_pgtable(unsigned long address, pmdval_t pmd);
@@ -119,6 +120,14 @@ extern pmdval_t early_pmd_flags;
 
 #define arch_end_context_switch(prev)	do {} while(0)
 #endif	/* CONFIG_PARAVIRT_XXL */
+
+#ifdef CONFIG_PGTABLE_REPLICATION
+#define ptep_get ptep_get
+static inline pte_t ptep_get(pte_t *ptep)
+{
+	return pgtable_repl_get_pte(ptep);
+}
+#endif /* CONFIG_PGTABLE_REPLICATION */
 
 /*
  * The following only work if pte_present() is true.
@@ -1064,37 +1073,43 @@ extern int ptep_clear_flush_young(struct vm_area_struct *vma,
 
 #define __HAVE_ARCH_PTEP_GET_AND_CLEAR
 static inline pte_t ptep_get_and_clear(struct mm_struct *mm, unsigned long addr,
-				       pte_t *ptep)
+                                       pte_t *ptep)
 {
-	pte_t pte = native_ptep_get_and_clear(ptep);
-	page_table_check_pte_clear(mm, addr, pte);
-	return pte;
+      pte_t pte = pgtable_repl_ptep_get_and_clear(mm, ptep);
+      page_table_check_pte_clear(mm, addr, pte);
+      return pte;
 }
 
 #define __HAVE_ARCH_PTEP_GET_AND_CLEAR_FULL
 static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
-					    unsigned long addr, pte_t *ptep,
-					    int full)
+                                            unsigned long addr, pte_t *ptep,
+                                            int full)
 {
-	pte_t pte;
-	if (full) {
-		/*
-		 * Full address destruction in progress; paravirt does not
-		 * care about updates and native needs no locking
-		 */
-		pte = native_local_ptep_get_and_clear(ptep);
-		page_table_check_pte_clear(mm, addr, pte);
-	} else {
-		pte = ptep_get_and_clear(mm, addr, ptep);
-	}
-	return pte;
+    pte_t pte;
+
+#ifdef CONFIG_PGTABLE_REPLICATION
+    if (mm && mm != &init_mm && smp_load_acquire(&mm->repl_pgd_enabled)) {
+        pte = pgtable_repl_ptep_get_and_clear(mm, ptep);
+        page_table_check_pte_clear(mm, addr, pte);
+        return pte;
+    }
+#endif
+
+    if (full) {
+        pte = native_local_ptep_get_and_clear(ptep);
+    } else {
+        pte = native_ptep_get_and_clear(ptep);
+    }
+
+    page_table_check_pte_clear(mm, addr, pte);
+    return pte;
 }
 
 #define __HAVE_ARCH_PTEP_SET_WRPROTECT
 static inline void ptep_set_wrprotect(struct mm_struct *mm,
 				      unsigned long addr, pte_t *ptep)
 {
-	clear_bit(_PAGE_BIT_RW, (unsigned long *)&ptep->pte);
+	pgtable_repl_ptep_set_wrprotect(mm, addr, ptep);
 }
 
 #define flush_tlb_fix_spurious_fault(vma, address, ptep) do { } while (0)

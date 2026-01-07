@@ -19,6 +19,10 @@
 #include <asm/apic.h>
 #include <asm/perf_event.h>
 
+#ifdef CONFIG_PGTABLE_REPLICATION
+#include <asm/pgtable_repl.h>
+#endif
+
 #include "mm_internal.h"
 
 #ifdef CONFIG_PARAVIRT
@@ -491,6 +495,20 @@ void cr4_update_pce(void *ignored)
 static inline void cr4_update_pce_mm(struct mm_struct *mm) { }
 #endif
 
+#ifdef CONFIG_PGTABLE_REPLICATION
+
+static inline void track_cr3_write(struct mm_struct *mm, bool using_replica)
+{
+	if (mm->repl_pgd_enabled) {
+		atomic_inc(&total_cr3_writes);
+		if (using_replica)
+			atomic_inc(&replica_hits);
+		else
+			atomic_inc(&primary_hits);
+	}
+}
+#endif
+
 void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 			struct task_struct *tsk)
 {
@@ -502,6 +520,91 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	u64 next_tlb_gen;
 	bool need_flush;
 	u16 new_asid;
+	pgd_t *pgd_to_use;
+
+#ifdef CONFIG_PGTABLE_REPLICATION
+	bool using_replica = false;
+	bool rcu_held = false;
+	int local_node = numa_node_id();
+	int target_node;
+	bool repl_enabled;
+	bool repl_in_progress;
+	pgd_t *selected_replica = NULL;
+
+	/*
+	 * Take RCU read lock and HOLD IT until after CR3 is loaded.
+	 * This prevents pgtable_repl_disable() from freeing replicas
+	 * while we're still using them.
+	 */
+	rcu_read_lock();
+	rcu_held = true;
+
+	/*
+	 * Read repl_pgd_enabled with acquire semantics first.
+	 * This synchronizes with the release in pgtable_repl_disable().
+	 */
+	repl_enabled = smp_load_acquire(&next->repl_pgd_enabled);
+
+	/*
+	 * Always start with the primary PGD as default.
+	 */
+	pgd_to_use = next->pgd;
+
+	if (repl_enabled) {
+		/*
+		 * Check if replication is in progress.
+		 * If so, we must NOT use replicas as they may be incomplete.
+		 */
+		repl_in_progress = smp_load_acquire(&next->repl_in_progress);
+
+		if (!repl_in_progress) {
+			/* Replication complete - safe to use replicas */
+			pgd_t *node_pgd;
+			int steered_node;
+
+			/*
+			 * Use steering matrix: physical node -> replica node.
+			 * If steering[local_node] is -1 (auto), use local node.
+			 */
+			steered_node = READ_ONCE(next->repl_steering[local_node]);
+			if (steered_node >= 0 && steered_node < MAX_NUMNODES) {
+				target_node = steered_node;
+			} else {
+				/* Auto mode: use local node */
+				target_node = local_node;
+			}
+
+			node_pgd = READ_ONCE(next->pgd_replicas[target_node]);
+
+			/*
+			 * Validate the replica pointer thoroughly:
+			 * 1. Must be non-NULL
+			 * 2. Must be a valid kernel address
+			 * 3. Replication must STILL be enabled (double-check)
+			 * 4. Replication must NOT be in progress (double-check)
+			 * 5. Page must exist and be on the expected node
+			 */
+			if (node_pgd && virt_addr_valid(node_pgd)) {
+				if (smp_load_acquire(&next->repl_pgd_enabled) &&
+				    !smp_load_acquire(&next->repl_in_progress)) {
+					struct page *pgd_page = virt_to_page(node_pgd);
+
+					if (pgd_page && page_to_nid(pgd_page) == target_node) {
+						unsigned long pa = __pa(node_pgd);
+						if (pa && pfn_valid(pa >> PAGE_SHIFT)) {
+							selected_replica = node_pgd;
+							pgd_to_use = node_pgd;
+							using_replica = (node_pgd != next->pgd);
+						}
+					}
+				}
+			}
+		}
+		/* If repl_in_progress is true, we keep pgd_to_use = next->pgd */
+	}
+#else
+	pgd_to_use = next->pgd;
+#endif
 
 	/*
 	 * NB: The scheduler will call us with prev == next when switching
@@ -516,91 +619,78 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	if (IS_ENABLED(CONFIG_PROVE_LOCKING))
 		WARN_ON_ONCE(!irqs_disabled());
 
-	/*
-	 * Verify that CR3 is what we think it is.  This will catch
-	 * hypothetical buggy code that directly switches to swapper_pg_dir
-	 * without going through leave_mm() / switch_mm_irqs_off() or that
-	 * does something like write_cr3(read_cr3_pa()).
-	 *
-	 * Only do this check if CONFIG_DEBUG_VM=y because __read_cr3()
-	 * isn't free.
-	 */
-#ifdef CONFIG_DEBUG_VM
-	if (WARN_ON_ONCE(__read_cr3() != build_cr3(real_prev->pgd, prev_asid,
-						   tlbstate_lam_cr3_mask()))) {
-		/*
-		 * If we were to BUG here, we'd be very likely to kill
-		 * the system so hard that we don't see the call trace.
-		 * Try to recover instead by ignoring the error and doing
-		 * a global flush to minimize the chance of corruption.
-		 *
-		 * (This is far from being a fully correct recovery.
-		 *  Architecturally, the CPU could prefetch something
-		 *  back into an incorrect ASID slot and leave it there
-		 *  to cause trouble down the road.  It's better than
-		 *  nothing, though.)
-		 */
-		__flush_tlb_all();
-	}
-#endif
 	if (was_lazy)
 		this_cpu_write(cpu_tlbstate_shared.is_lazy, false);
 
-	/*
-	 * The membarrier system call requires a full memory barrier and
-	 * core serialization before returning to user-space, after
-	 * storing to rq->curr, when changing mm.  This is because
-	 * membarrier() sends IPIs to all CPUs that are in the target mm
-	 * to make them issue memory barriers.  However, if another CPU
-	 * switches to/from the target mm concurrently with
-	 * membarrier(), it can cause that CPU not to receive an IPI
-	 * when it really should issue a memory barrier.  Writing to CR3
-	 * provides that full memory barrier and core serializing
-	 * instruction.
-	 */
 	if (real_prev == next) {
 		/* Not actually switching mm's */
 		VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[prev_asid].ctx_id) !=
 			   next->context.ctx_id);
 
-		/*
-		 * If this races with another thread that enables lam, 'new_lam'
-		 * might not match tlbstate_lam_cr3_mask().
-		 */
-
-		/*
-		 * Even in lazy TLB mode, the CPU should stay set in the
-		 * mm_cpumask. The TLB shootdown code can figure out from
-		 * cpu_tlbstate_shared.is_lazy whether or not to send an IPI.
-		 */
 		if (WARN_ON_ONCE(real_prev != &init_mm &&
 				 !cpumask_test_cpu(cpu, mm_cpumask(next))))
 			cpumask_set_cpu(cpu, mm_cpumask(next));
 
-		/*
-		 * If the CPU is not in lazy TLB mode, we are just switching
-		 * from one thread in a process to another thread in the same
-		 * process. No TLB flush required.
-		 */
-		if (!was_lazy)
-			return;
+#ifdef CONFIG_PGTABLE_REPLICATION
+		if (selected_replica) {
+			unsigned long current_cr3_pa = __read_cr3() & PAGE_MASK;
+			unsigned long target_cr3_pa = __pa(selected_replica);
 
-		/*
-		 * Read the tlb_gen to check whether a flush is needed.
-		 * If the TLB is up to date, just use it.
-		 * The barrier synchronizes with the tlb_gen increment in
-		 * the TLB shootdown code.
-		 */
+			if (current_cr3_pa != target_cr3_pa) {
+				/* Final safety check: enabled AND not in progress */
+				if (smp_load_acquire(&next->repl_pgd_enabled) &&
+				    !smp_load_acquire(&next->repl_in_progress)) {
+					unsigned long new_cr3 = target_cr3_pa | (__read_cr3() & ~PAGE_MASK);
+
+					native_write_cr3(new_cr3);
+					track_cr3_write(next, using_replica);
+					__flush_tlb_all();
+				}
+
+				rcu_read_unlock();
+				rcu_held = false;
+				return;
+			}
+		} else if (repl_enabled) {
+			/*
+			 * NEW: No replica selected (either in_progress or validation failed).
+			 * Ensure we're using the primary PGD, not a stale replica.
+			 */
+			unsigned long current_cr3_pa = __read_cr3() & PAGE_MASK;
+			unsigned long primary_cr3_pa = __pa(next->pgd);
+
+			if (current_cr3_pa != primary_cr3_pa) {
+				unsigned long new_cr3 = primary_cr3_pa | (__read_cr3() & ~PAGE_MASK);
+				native_write_cr3(new_cr3);
+				track_cr3_write(next, false);
+				__flush_tlb_all();
+
+				rcu_read_unlock();
+				rcu_held = false;
+				return;
+			}
+		}
+#endif
+
+		if (!was_lazy) {
+#ifdef CONFIG_PGTABLE_REPLICATION
+			if (rcu_held)
+				rcu_read_unlock();
+#endif
+			return;
+		}
+
 		smp_mb();
 		next_tlb_gen = atomic64_read(&next->context.tlb_gen);
 		if (this_cpu_read(cpu_tlbstate.ctxs[prev_asid].tlb_gen) ==
-				next_tlb_gen)
+				next_tlb_gen) {
+#ifdef CONFIG_PGTABLE_REPLICATION
+			if (rcu_held)
+				rcu_read_unlock();
+#endif
 			return;
+		}
 
-		/*
-		 * TLB contents went out of date while we were in lazy
-		 * mode. Fall through to the TLB switching code below.
-		 */
 		new_asid = prev_asid;
 		need_flush = true;
 	} else {
@@ -612,8 +702,6 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 
 		/*
 		 * Stop remote flushes for the previous mm.
-		 * Skip kernel threads; we never send init_mm TLB flushing IPIs,
-		 * but the bitmap manipulation can cause cache line contention.
 		 */
 		if (real_prev != &init_mm) {
 			VM_WARN_ON_ONCE(!cpumask_test_cpu(cpu,
@@ -635,17 +723,36 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 		barrier();
 	}
 
+#ifdef CONFIG_PGTABLE_REPLICATION
+	/*
+	 * Final replication check before loading CR3.
+	 * If replication was disabled OR entered in-progress state during
+	 * our execution, fall back to the primary PGD.
+	 */
+	if (selected_replica) {
+		if (!smp_load_acquire(&next->repl_pgd_enabled) ||
+		    smp_load_acquire(&next->repl_in_progress)) {
+			pgd_to_use = next->pgd;
+			using_replica = false;
+			selected_replica = NULL;
+		}
+	}
+#endif
+
 	set_tlbstate_lam_mode(next);
 	if (need_flush) {
 		this_cpu_write(cpu_tlbstate.ctxs[new_asid].ctx_id, next->context.ctx_id);
 		this_cpu_write(cpu_tlbstate.ctxs[new_asid].tlb_gen, next_tlb_gen);
-		load_new_mm_cr3(next->pgd, new_asid, new_lam, true);
-
+		load_new_mm_cr3(pgd_to_use, new_asid, new_lam, true);
+#ifdef CONFIG_PGTABLE_REPLICATION
+		track_cr3_write(next, using_replica);
+#endif
 		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
 	} else {
-		/* The new ASID is already up to date. */
-		load_new_mm_cr3(next->pgd, new_asid, new_lam, false);
-
+		load_new_mm_cr3(pgd_to_use, new_asid, new_lam, false);
+#ifdef CONFIG_PGTABLE_REPLICATION
+		track_cr3_write(next, using_replica);
+#endif
 		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, 0);
 	}
 
@@ -654,6 +761,14 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 
 	this_cpu_write(cpu_tlbstate.loaded_mm, next);
 	this_cpu_write(cpu_tlbstate.loaded_mm_asid, new_asid);
+
+#ifdef CONFIG_PGTABLE_REPLICATION
+	/*
+	 * CR3 has been loaded. NOW it's safe to release RCU.
+	 */
+	if (rcu_held)
+		rcu_read_unlock();
+#endif
 
 	if (next != real_prev) {
 		cr4_update_pce_mm(next);
@@ -1026,6 +1141,15 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 	 * flush_tlb_func_local() directly in this case.
 	 */
 	if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids) {
+#ifdef CONFIG_PGTABLE_REPLICATION
+		/* Track TLB shootdowns for Mitosis-enabled processes */
+		if (mm->repl_pgd_enabled) {
+			int ipis_sent = cpumask_weight(mm_cpumask(mm)) - 1; /* -1 for local CPU */
+			atomic64_inc(&mm->mitosis_tlb_shootdowns);
+			if (ipis_sent > 0)
+				atomic64_add(ipis_sent, &mm->mitosis_tlb_ipis_sent);
+		}
+#endif
 		flush_tlb_multi(mm_cpumask(mm), info);
 	} else if (mm == this_cpu_read(cpu_tlbstate.loaded_mm)) {
 		lockdep_assert_irqs_enabled();

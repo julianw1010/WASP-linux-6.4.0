@@ -506,7 +506,7 @@ static pte_t *alloc_p2m_pmd(unsigned long addr, pte_t *pte_pg)
 		spin_unlock_irqrestore(&p2m_update_lock, flags);
 
 		if (pte_newpg[i]) {
-			paravirt_release_pte(__pa(pte_newpg[i]) >> PAGE_SHIFT);
+			paravirt_release_pte(&init_mm, __pa(pte_newpg[i]) >> PAGE_SHIFT);
 			free_p2m_page(pte_newpg[i]);
 		}
 

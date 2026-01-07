@@ -19,8 +19,13 @@
 #include <linux/workqueue.h>
 #include <linux/seqlock.h>
 #include <linux/percpu_counter.h>
+#ifdef CONFIG_PGTABLE_REPLICATION
+#include <linux/nodemask.h>
+#endif
 
 #include <asm/mmu.h>
+
+#include <linux/ktime.h>
 
 #ifndef AT_VECTOR_SIZE_ARCH
 #define AT_VECTOR_SIZE_ARCH 0
@@ -70,6 +75,9 @@ struct mem_cgroup;
 #else
 #define _struct_page_alignment	__aligned(sizeof(unsigned long))
 #endif
+
+/* Fixed NUMA node count to avoid large stack frames */
+#define NUMA_NODE_COUNT 8
 
 struct page {
 	unsigned long flags;		/* Atomic flags, some possibly
@@ -227,6 +235,10 @@ struct page {
 
 #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
 	int _last_cpupid;
+#endif
+
+#ifdef CONFIG_PGTABLE_REPLICATION
+            struct page *pt_replica;  /* Circular linked list of replica pages */
 #endif
 } _struct_page_alignment;
 
@@ -597,6 +609,62 @@ struct mm_struct {
 		unsigned long mmap_compat_legacy_base;
 #endif
 		unsigned long task_size;	/* size of task vm space */
+		
+#ifdef CONFIG_PGTABLE_REPLICATION
+		bool repl_pgd_enabled;           /* Is replication active for this mm? */
+		bool repl_in_progress;           /* Replication operation in progress */
+		bool repl_pending_enable;        /* Pending enable after exec */
+		nodemask_t repl_pgd_nodes;       /* Which nodes have replicas */
+		nodemask_t repl_pending_nodes;   /* Nodes to enable after exec */
+		struct mutex repl_mutex;         /* Protects replication state */
+		spinlock_t repl_alloc_lock;      /* Spinlock for atomic context */
+		pgd_t *pgd_replicas[NUMA_NODE_COUNT]; /* Per-node PGD replicas */
+		pgd_t *original_pgd;             /* Original primary PGD */
+				/*
+		 * Steering matrix: maps physical NUMA node to optimal replica node.
+		 * Value of -1 means "use local node" (auto mode).
+		 * Set by userspace via prctl(PR_SET_PGTABLE_REPL_STEERING).
+		 */
+		int repl_steering[NUMA_NODE_COUNT];
+		
+                /* Page table allocation tracking per NUMA node */
+             	/* Current counts (increment on alloc, decrement on free) */
+		atomic_t pgtable_alloc_pte[NUMA_NODE_COUNT];
+		atomic_t pgtable_alloc_pmd[NUMA_NODE_COUNT];
+		atomic_t pgtable_alloc_pud[NUMA_NODE_COUNT];
+		atomic_t pgtable_alloc_p4d[NUMA_NODE_COUNT];
+		atomic_t pgtable_alloc_pgd[NUMA_NODE_COUNT];
+		
+		/* Peak/max counts (maximum value ever observed) */
+                atomic_t pgtable_max_pte[NUMA_NODE_COUNT];
+		atomic_t pgtable_max_pmd[NUMA_NODE_COUNT];
+		atomic_t pgtable_max_pud[NUMA_NODE_COUNT];
+		atomic_t pgtable_max_p4d[NUMA_NODE_COUNT];
+		atomic_t pgtable_max_pgd[NUMA_NODE_COUNT];
+		
+	        /* Mitosis statistics tracking */
+		atomic64_t mitosis_tlb_shootdowns;      /* Total TLB shootdown events */
+		atomic64_t mitosis_tlb_ipis_sent;       /* Total IPIs sent for shootdowns */
+		/* Current replica counts (increment on alloc, decrement on free) */
+		atomic64_t mitosis_pgd_replicas[NUMA_NODE_COUNT];
+		atomic64_t mitosis_p4d_replicas[NUMA_NODE_COUNT];
+		atomic64_t mitosis_pud_replicas[NUMA_NODE_COUNT];
+		atomic64_t mitosis_pmd_replicas[NUMA_NODE_COUNT];
+		atomic64_t mitosis_pte_replicas[NUMA_NODE_COUNT];
+		
+		/* Peak replica counts (maximum overhead observed) */
+		atomic64_t mitosis_max_pgd_replicas[NUMA_NODE_COUNT];
+		atomic64_t mitosis_max_p4d_replicas[NUMA_NODE_COUNT];
+		atomic64_t mitosis_max_pud_replicas[NUMA_NODE_COUNT];
+		atomic64_t mitosis_max_pmd_replicas[NUMA_NODE_COUNT];
+		atomic64_t mitosis_max_pte_replicas[NUMA_NODE_COUNT];
+		ktime_t mitosis_repl_start_time;        /* When replication was enabled */
+		pid_t mitosis_owner_pid;                /* PID when replication was enabled */
+		pid_t mitosis_owner_tgid;               /* TGID when replication was enabled */
+		char mitosis_owner_comm[16];            /* Comm when replication was enabled */
+		char mitosis_cmdline[256];              /* Command line when replication was enabled */
+#endif
+		
 		pgd_t * pgd;
 
 #ifdef CONFIG_MEMBARRIER

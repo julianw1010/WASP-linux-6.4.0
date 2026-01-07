@@ -2777,6 +2777,10 @@ static inline bool pgtable_pte_page_ctor(struct page *page)
 		return false;
 	__SetPageTable(page);
 	inc_lruvec_page_state(page, NR_PAGETABLE);
+#ifdef CONFIG_PGTABLE_REPLICATION
+	page->pt_replica = NULL;
+#endif
+
 	return true;
 }
 
@@ -2872,6 +2876,9 @@ static inline bool pgtable_pmd_page_ctor(struct page *page)
 		return false;
 	__SetPageTable(page);
 	inc_lruvec_page_state(page, NR_PAGETABLE);
+#ifdef CONFIG_PGTABLE_REPLICATION
+	page->pt_replica = NULL;
+#endif
 	return true;
 }
 

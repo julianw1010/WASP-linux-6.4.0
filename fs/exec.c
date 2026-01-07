@@ -76,6 +76,10 @@
 
 #include <trace/events/sched.h>
 
+#ifdef CONFIG_PGTABLE_REPLICATION
+#include <asm/pgtable_repl.h>
+#endif
+
 static int bprm_creds_from_file(struct linux_binprm *bprm);
 
 int suid_dumpable = 0;
@@ -983,6 +987,7 @@ static int exec_mmap(struct mm_struct *mm)
 	/* Notify parent that we're no longer interested in the old VM */
 	tsk = current;
 	old_mm = current->mm;
+	
 	exec_mm_release(tsk, old_mm);
 	if (old_mm)
 		sync_mm_rss(old_mm);
@@ -1033,9 +1038,12 @@ static int exec_mmap(struct mm_struct *mm)
 		setmax_mm_hiwater_rss(&tsk->signal->maxrss, old_mm);
 		mm_update_next_owner(old_mm);
 		mmput(old_mm);
+
 		return 0;
 	}
+	
 	mmdrop_lazy_tlb(active_mm);
+	
 	return 0;
 }
 
@@ -1532,6 +1540,16 @@ static struct linux_binprm *alloc_bprm(int fd, struct filename *filename)
 	retval = bprm_mm_init(bprm);
 	if (retval)
 		goto out_free;
+		
+#ifdef CONFIG_PGTABLE_REPLICATION
+	/* Mark for deferred enable after mm is fully active */
+	if (current->mm && current->mm->repl_pgd_enabled &&
+	    !nodes_empty(current->mm->repl_pgd_nodes)) {
+		bprm->mm->repl_pending_enable = true;
+		bprm->mm->repl_pending_nodes = current->mm->repl_pgd_nodes;
+	}
+#endif
+
 	return bprm;
 
 out_free:
@@ -1863,6 +1881,17 @@ static int bprm_execve(struct linux_binprm *bprm,
 	user_events_execve(current);
 	acct_update_integrals(current);
 	task_numa_free(current, false);
+	
+	// In bprm_execve(), after exec_binprm() succeeds and before returning:
+#ifdef CONFIG_PGTABLE_REPLICATION
+	/* Now fully exec'd - safe to enable replication */
+	if (current->mm && current->mm->repl_pending_enable) {
+		pgtable_repl_enable(current->mm, current->mm->repl_pending_nodes);
+		current->mm->repl_pending_enable = false;
+		nodes_clear(current->mm->repl_pending_nodes);
+	}
+#endif
+	
 	return retval;
 
 out:

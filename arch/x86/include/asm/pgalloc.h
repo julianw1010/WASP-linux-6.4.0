@@ -6,6 +6,10 @@
 #include <linux/mm.h>		/* for struct page */
 #include <linux/pagemap.h>
 
+#ifdef CONFIG_PGTABLE_REPLICATION
+#include <asm/pgtable_repl.h>
+#endif
+
 #define __HAVE_ARCH_PTE_ALLOC_ONE
 #define __HAVE_ARCH_PGD_FREE
 #include <asm-generic/pgalloc.h>
@@ -149,20 +153,66 @@ static inline void pgd_populate_safe(struct mm_struct *mm, pgd_t *pgd, p4d_t *p4
 
 static inline p4d_t *p4d_alloc_one(struct mm_struct *mm, unsigned long addr)
 {
-	gfp_t gfp = GFP_KERNEL_ACCOUNT;
+    gfp_t gfp = GFP_KERNEL_ACCOUNT;
+    struct page *page;
 
-	if (mm == &init_mm)
-		gfp &= ~__GFP_ACCOUNT;
-	return (p4d_t *)get_zeroed_page(gfp);
+    if (mm == &init_mm)
+        gfp &= ~__GFP_ACCOUNT;
+
+#ifdef CONFIG_PGTABLE_REPLICATION
+    {
+        int node = mitosis_alloc_p4d_node(mm, numa_node_id());
+
+        /* Try cache first when replication is enabled */
+        if (mm && mm != &init_mm && smp_load_acquire(&mm->repl_pgd_enabled)) {
+            page = mitosis_cache_pop(node, MITOSIS_CACHE_P4D);
+            if (page) {
+                mitosis_track_p4d_alloc(mm, page_to_nid(page));
+                return (p4d_t *)page_address(page);
+            }
+        }
+
+        /* Cache miss or replication disabled - allocate normally */
+        page = alloc_pages_node(node, gfp | __GFP_ZERO, 0);
+        if (page) {
+            mitosis_track_p4d_alloc(mm, page_to_nid(page));
+            return (p4d_t *)page_address(page);
+        }
+        return NULL;
+    }
+#else
+    return (p4d_t *)get_zeroed_page(gfp);
+#endif
 }
 
 static inline void p4d_free(struct mm_struct *mm, p4d_t *p4d)
 {
-	if (!pgtable_l5_enabled())
-		return;
+    struct page *page;
+    int nid;
+    bool from_cache;
 
-	BUG_ON((unsigned long)p4d & (PAGE_SIZE-1));
-	free_page((unsigned long)p4d);
+    if (!pgtable_l5_enabled())
+        return;
+    BUG_ON((unsigned long)p4d & (PAGE_SIZE-1));
+
+    page = virt_to_page(p4d);
+    nid = page_to_nid(page);
+    from_cache = PageMitosisFromCache(page);
+
+#ifdef CONFIG_PGTABLE_REPLICATION
+    mitosis_free_p4d_node(mm, page);
+
+    /* Try to return to cache if page was originally from cache */
+    if (from_cache) {
+        ClearPageMitosisFromCache(page);
+        page->pt_replica = NULL;
+        if (mitosis_cache_push(page, nid, MITOSIS_CACHE_P4D))
+            return;  /* Successfully cached */
+    }
+
+    ClearPageMitosisFromCache(page);
+#endif
+    free_page((unsigned long)p4d);
 }
 
 extern void ___p4d_free_tlb(struct mmu_gather *tlb, p4d_t *p4d);

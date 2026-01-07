@@ -33,6 +33,7 @@
 #include <asm/tlb.h>
 #include <asm/io_bitmap.h>
 #include <asm/gsseg.h>
+#include <asm/pgtable_repl.h>
 
 /*
  * nop stub, which must not clobber anything *including the stack* to
@@ -306,10 +307,33 @@ struct paravirt_patch_template pv_ops = {
 	.mmu.write_cr2		= pv_native_write_cr2,
 	.mmu.read_cr3		= __native_read_cr3,
 	.mmu.write_cr3		= native_write_cr3,
-
 	.mmu.pgd_alloc		= __paravirt_pgd_alloc,
 	.mmu.pgd_free		= paravirt_nop,
-
+#ifdef CONFIG_PGTABLE_REPLICATION
+	.mmu.alloc_pte		= pgtable_repl_alloc_pte,
+	.mmu.alloc_pmd		= pgtable_repl_alloc_pmd,
+	.mmu.alloc_pud		= pgtable_repl_alloc_pud,
+	.mmu.alloc_p4d		= pgtable_repl_alloc_p4d,
+	.mmu.release_pte	= pgtable_repl_release_pte,
+	.mmu.release_pmd	= pgtable_repl_release_pmd,
+	.mmu.release_pud	= pgtable_repl_release_pud,
+	.mmu.release_p4d	= pgtable_repl_release_p4d,
+	.mmu.set_pte		= pgtable_repl_set_pte,
+	.mmu.set_pmd		= pgtable_repl_set_pmd,
+	.mmu.ptep_modify_prot_start	= __ptep_modify_prot_start,
+	.mmu.ptep_modify_prot_commit	= pgtable_repl_ptep_modify_prot_commit,
+	.mmu.set_pud		= pgtable_repl_set_pud,
+	.mmu.pmd_val		= PTE_IDENT,
+	.mmu.make_pmd		= PTE_IDENT,
+	.mmu.pud_val		= PTE_IDENT,
+	.mmu.make_pud		= PTE_IDENT,
+	.mmu.set_p4d		= pgtable_repl_set_p4d,
+#if CONFIG_PGTABLE_LEVELS >= 5
+	.mmu.p4d_val		= PTE_IDENT,
+	.mmu.make_p4d		= PTE_IDENT,
+	.mmu.set_pgd		= pgtable_repl_set_pgd,
+#endif /* CONFIG_PGTABLE_LEVELS >= 5 */
+#else /* !CONFIG_PGTABLE_REPLICATION */
 	.mmu.alloc_pte		= paravirt_nop,
 	.mmu.alloc_pmd		= paravirt_nop,
 	.mmu.alloc_pud		= paravirt_nop,
@@ -318,29 +342,22 @@ struct paravirt_patch_template pv_ops = {
 	.mmu.release_pmd	= paravirt_nop,
 	.mmu.release_pud	= paravirt_nop,
 	.mmu.release_p4d	= paravirt_nop,
-
 	.mmu.set_pte		= native_set_pte,
 	.mmu.set_pmd		= native_set_pmd,
-
 	.mmu.ptep_modify_prot_start	= __ptep_modify_prot_start,
 	.mmu.ptep_modify_prot_commit	= __ptep_modify_prot_commit,
-
 	.mmu.set_pud		= native_set_pud,
-
 	.mmu.pmd_val		= PTE_IDENT,
 	.mmu.make_pmd		= PTE_IDENT,
-
 	.mmu.pud_val		= PTE_IDENT,
 	.mmu.make_pud		= PTE_IDENT,
-
 	.mmu.set_p4d		= native_set_p4d,
-
 #if CONFIG_PGTABLE_LEVELS >= 5
 	.mmu.p4d_val		= PTE_IDENT,
 	.mmu.make_p4d		= PTE_IDENT,
-
 	.mmu.set_pgd		= native_set_pgd,
 #endif /* CONFIG_PGTABLE_LEVELS >= 5 */
+#endif /* CONFIG_PGTABLE_REPLICATION */
 
 	.mmu.pte_val		= PTE_IDENT,
 	.mmu.pgd_val		= PTE_IDENT,
