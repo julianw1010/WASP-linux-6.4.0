@@ -273,7 +273,7 @@ struct page *pt_replica;
 ## References
 
 - [Mitosis: Transparently Self-Replicating Page-Tables for Large-Memory Machines](https://dl.acm.org/doi/10.1145/3373376.3378468) (ASPLOS 2020)
-- [WASP: Workload-Aware Self-Replicating Page Tables](https://dl.acm.org/doi/10.1145/3620665.3640369) (ISCA 2021)
+- [WASP: Workload-Aware Self-Replicating Page Tables](https://dl.acm.org/doi/10.1145/3620665.3640369) (ASPLOS '24)
 
 ## License
 
