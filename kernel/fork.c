@@ -1736,6 +1736,10 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
 {
 	struct mm_struct *mm;
 	int err;
+#ifdef CONFIG_PGTABLE_REPLICATION
+    bool saved_cache_only_mode = oldmm->cache_only_mode;
+#endif
+
 
 	mm = allocate_mm();
 	if (!mm)
