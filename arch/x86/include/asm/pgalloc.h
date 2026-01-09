@@ -163,8 +163,9 @@ static inline p4d_t *p4d_alloc_one(struct mm_struct *mm, unsigned long addr)
     {
         int node = mitosis_alloc_p4d_node(mm, numa_node_id());
 
-        /* Try cache first when replication is enabled */
-        if (mm && mm != &init_mm && smp_load_acquire(&mm->repl_pgd_enabled)) {
+        /* Try cache first when in cache-only mode OR replication is enabled */
+        if (mm && mm != &init_mm && 
+            (!sysctl_mitosis_enabled || smp_load_acquire(&mm->repl_pgd_enabled))) {
             page = mitosis_cache_pop(node, MITOSIS_CACHE_P4D);
             if (page) {
                 mitosis_track_p4d_alloc(mm, page_to_nid(page));

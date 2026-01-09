@@ -1428,6 +1428,10 @@ int pgtable_repl_enable(struct mm_struct *mm, nodemask_t nodes)
 
     if (!mm || mm == &init_mm || nodes_empty(nodes) || nodes_weight(nodes) < 2)
         return -EINVAL;
+        
+    /* Cache-only mode - silently succeed without enabling replication */
+    if (!sysctl_mitosis_enabled)
+        return 0;
 
     for_each_node_mask(node, nodes) {
         if (!node_online(node))
@@ -2501,6 +2505,7 @@ void mitosis_free_pgd_node(struct mm_struct *mm, struct page *page)
 
 #endif
 
+EXPORT_SYMBOL(sysctl_mitosis_enabled);
 EXPORT_SYMBOL(pgtable_repl_enable);
 EXPORT_SYMBOL(pgtable_repl_disable);
 EXPORT_SYMBOL(pgtable_repl_set_pte);

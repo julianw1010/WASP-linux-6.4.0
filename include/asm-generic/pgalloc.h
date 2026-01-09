@@ -26,8 +26,10 @@ static inline pte_t *__pte_alloc_one_kernel(struct mm_struct *mm)
     int node = mitosis_alloc_pte_node(mm, numa_node_id());
     struct page *page;
 
-    /* Try cache first when replication is enabled */
-    if (mm && mm != &init_mm && smp_load_acquire(&mm->repl_pgd_enabled)) {
+    /* Try cache first when in cache-only mode OR replication is enabled */
+    if (mm && mm != &init_mm && 
+        (!sysctl_mitosis_enabled || smp_load_acquire(&mm->repl_pgd_enabled))) {
+
         page = mitosis_cache_pop(node, MITOSIS_CACHE_PTE);
         if (page) {
             mitosis_track_pte_alloc(mm, page_to_nid(page));
@@ -107,8 +109,9 @@ static inline pgtable_t __pte_alloc_one(struct mm_struct *mm, gfp_t gfp)
     {
         int node = mitosis_alloc_pte_node(mm, numa_node_id());
 
-        /* Try cache first when replication is enabled */
-        if (mm && mm != &init_mm && smp_load_acquire(&mm->repl_pgd_enabled)) {
+        /* Try cache first when in cache-only mode OR replication is enabled */
+        if (mm && mm != &init_mm && 
+            (!sysctl_mitosis_enabled || smp_load_acquire(&mm->repl_pgd_enabled))) {
             pte = mitosis_cache_pop(node, MITOSIS_CACHE_PTE);
             if (pte) {
                 if (!pgtable_pte_page_ctor(pte)) {
@@ -222,8 +225,9 @@ static inline pmd_t *pmd_alloc_one(struct mm_struct *mm, unsigned long addr)
     {
         int node = mitosis_alloc_pmd_node(mm, numa_node_id());
 
-        /* Try cache first when replication is enabled */
-        if (mm && mm != &init_mm && smp_load_acquire(&mm->repl_pgd_enabled)) {
+        /* Try cache first when in cache-only mode OR replication is enabled */
+        if (mm && mm != &init_mm && 
+            (!sysctl_mitosis_enabled || smp_load_acquire(&mm->repl_pgd_enabled))) {
             page = mitosis_cache_pop(node, MITOSIS_CACHE_PMD);
             if (page) {
                 if (!pgtable_pmd_page_ctor(page)) {
@@ -305,8 +309,9 @@ static inline pud_t *__pud_alloc_one(struct mm_struct *mm, unsigned long addr)
     {
         int node = mitosis_alloc_pud_node(mm, numa_node_id());
 
-        /* Try cache first when replication is enabled */
-        if (mm && mm != &init_mm && smp_load_acquire(&mm->repl_pgd_enabled)) {
+        /* Try cache first when in cache-only mode OR replication is enabled */
+        if (mm && mm != &init_mm && 
+            (!sysctl_mitosis_enabled || smp_load_acquire(&mm->repl_pgd_enabled))) {
             page = mitosis_cache_pop(node, MITOSIS_CACHE_PUD);
             if (page) {
                 mitosis_track_pud_alloc(mm, page_to_nid(page));

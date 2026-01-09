@@ -115,6 +115,7 @@ int mitosis_cache_drain_all(void);
 
 extern int sysctl_mitosis_auto_enable;
 extern int sysctl_mitosis_inherit;
+extern int sysctl_mitosis_enabled;
 
 /* CR3 statistics - defined in pgtable_repl.c */
 extern atomic_t total_cr3_writes;

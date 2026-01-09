@@ -32,6 +32,8 @@ static u64 mitosis_seq_counter = 0;  /* Monotonic ID - never resets */
 struct proc_dir_entry *mitosis_proc_dir;
 EXPORT_SYMBOL(mitosis_proc_dir);
 
+int sysctl_mitosis_enabled = 1;  /* 1 = full mitosis, 0 = cache-only */
+
 extern atomic_t total_cr3_writes;
 extern atomic_t replica_hits;
 extern atomic_t primary_hits;
@@ -453,6 +455,8 @@ static int mitosis_status_show(struct seq_file *m, void *v)
 		   sysctl_mitosis_auto_enable == 1 ? "ENABLED" : "DISABLED");
 	seq_printf(m, "  Inheritance: %s\n",
 		   sysctl_mitosis_inherit == 1 ? "ENABLED" : "DISABLED");
+        seq_printf(m, "  Mitosis enabled: %s\n",
+		   sysctl_mitosis_enabled == 1 ? "FULL" : "CACHE-ONLY");
 	seq_printf(m, "\n");
 
 	total_writes = atomic_read(&total_cr3_writes);
@@ -842,6 +846,60 @@ static const struct proc_ops mitosis_cache_ops = {
 	.proc_release = single_release,
 };
 
+/*
+ * /proc/mitosis/enabled - Control mitosis mode
+ * Read: returns current mode (1 = full mitosis, 0 = cache-only)
+ * Write: 1 for full mitosis, 0 for cache-only mode
+ */
+static int mitosis_enabled_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", sysctl_mitosis_enabled);
+	return 0;
+}
+
+static int mitosis_enabled_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, mitosis_enabled_show, NULL);
+}
+
+static ssize_t mitosis_enabled_write(struct file *file, const char __user *buf,
+				     size_t count, loff_t *ppos)
+{
+	char kbuf[16];
+	long val;
+
+	if (count == 0 || count > sizeof(kbuf) - 1)
+		return -EINVAL;
+
+	if (copy_from_user(kbuf, buf, count))
+		return -EFAULT;
+
+	kbuf[count] = '\0';
+
+	if (kstrtol(kbuf, 10, &val))
+		return -EINVAL;
+
+	if (val != 0 && val != 1)
+		return -EINVAL;
+
+	sysctl_mitosis_enabled = (int)val;
+
+	if (val == 1)
+		pr_info("MITOSIS: Full mitosis mode ENABLED\n");
+	else
+		pr_info("MITOSIS: Cache-only mode ENABLED (replication disabled)\n");
+
+	return count;
+}
+
+static const struct proc_ops mitosis_enabled_ops = {
+	.proc_open = mitosis_enabled_open,
+	.proc_read = seq_read,
+	.proc_write = mitosis_enabled_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
 int __init mitosis_stats_init(void)
 {
 	/* Initialize the cache system */
@@ -866,12 +924,17 @@ int __init mitosis_stats_init(void)
 	if (!proc_create("inherit", 0644, mitosis_proc_dir, &mitosis_inherit_ops))
 		goto err_inherit;
 
-	if (!proc_create("cache", 0644, mitosis_proc_dir, &mitosis_cache_ops))
+        if (!proc_create("cache", 0644, mitosis_proc_dir, &mitosis_cache_ops))
 		goto err_cache;
+
+	if (!proc_create("enabled", 0644, mitosis_proc_dir, &mitosis_enabled_ops))
+		goto err_enabled;
 
 	pr_info("MITOSIS: Statistics interface initialized at /proc/mitosis/\n");
 	return 0;
 
+err_enabled:
+	remove_proc_entry("cache", mitosis_proc_dir);
 err_cache:
 	remove_proc_entry("inherit", mitosis_proc_dir);
 err_inherit:
@@ -894,6 +957,7 @@ void mitosis_stats_exit(void)
 	/* Drain cache before exit */
 	mitosis_cache_drain_all();
 
+	remove_proc_entry("enabled", mitosis_proc_dir);
 	remove_proc_entry("cache", mitosis_proc_dir);
 	remove_proc_entry("inherit", mitosis_proc_dir);
 	remove_proc_entry("mode", mitosis_proc_dir);
