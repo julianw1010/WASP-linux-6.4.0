@@ -1748,7 +1748,6 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
 	mm->repl_pgd_enabled = false;
 	mm->repl_in_progress = false;
 	mm->repl_pending_enable = false;
-	mm->cache_only_mode = oldmm->cache_only_mode;
 	nodes_clear(mm->repl_pgd_nodes);
 	nodes_clear(mm->repl_pending_nodes);
 	mutex_init(&mm->repl_mutex);
@@ -1778,6 +1777,11 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
 
 	if (!mm_init(mm, tsk, mm->user_ns))
 		goto fail_nomem;
+		
+#ifdef CONFIG_PGTABLE_REPLICATION
+   /* Inherit cache_only_mode AFTER mm_init (which resets it) */
+   mm->cache_only_mode = saved_cache_only_mode;
+#endif
 
 	err = dup_mmap(mm, oldmm);
 	if (err)
