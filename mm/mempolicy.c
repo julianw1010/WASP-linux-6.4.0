@@ -291,6 +291,9 @@ static struct mempolicy *mpol_new(unsigned short mode, unsigned short flags,
 		    (flags & MPOL_F_STATIC_NODES) ||
 		    (flags & MPOL_F_RELATIVE_NODES))
 			return ERR_PTR(-EINVAL);
+	} else if (mode == MPOL_PREFERRED_ORDER) {
+		if (nodes_empty(*nodes))
+			return ERR_PTR(-EINVAL);
 	} else if (nodes_empty(*nodes))
 		return ERR_PTR(-EINVAL);
 	policy = kmem_cache_alloc(policy_cache, GFP_KERNEL);
@@ -409,6 +412,10 @@ static const struct mempolicy_operations mpol_ops[MPOL_MAX] = {
 		.rebind = mpol_rebind_default,
 	},
 	[MPOL_PREFERRED_MANY] = {
+		.create = mpol_new_nodemask,
+		.rebind = mpol_rebind_preferred,
+	},
+	[MPOL_PREFERRED_ORDER] = {
 		.create = mpol_new_nodemask,
 		.rebind = mpol_rebind_preferred,
 	},
@@ -891,6 +898,7 @@ static void get_policy_nodemask(struct mempolicy *p, nodemask_t *nodes)
 	case MPOL_INTERLEAVE:
 	case MPOL_PREFERRED:
 	case MPOL_PREFERRED_MANY:
+	case MPOL_PREFERRED_ORDER:
 		*nodes = p->nodes;
 		break;
 	case MPOL_LOCAL:
@@ -1528,7 +1536,7 @@ SYSCALL_DEFINE4(set_mempolicy_home_node, unsigned long, start, unsigned long, le
 		old = vma_policy(vma);
 		if (!old)
 			continue;
-		if (old->mode != MPOL_BIND && old->mode != MPOL_PREFERRED_MANY) {
+		if (old->mode != MPOL_BIND && old->mode != MPOL_PREFERRED_MANY && old->mode != MPOL_PREFERRED_ORDER) {
 			err = -EOPNOTSUPP;
 			break;
 		}
@@ -1848,7 +1856,8 @@ nodemask_t *policy_nodemask(gfp_t gfp, struct mempolicy *policy)
 
 	if (mode == MPOL_PREFERRED_MANY)
 		return &policy->nodes;
-
+	if (mode == MPOL_PREFERRED_ORDER)
+		return &policy->nodes;
 	return NULL;
 }
 
@@ -1863,6 +1872,8 @@ static int policy_node(gfp_t gfp, struct mempolicy *policy, int nd)
 {
 	if (policy->mode == MPOL_PREFERRED) {
 		nd = first_node(policy->nodes);
+	} else if (policy->mode == MPOL_PREFERRED_ORDER) {
+		nd = first_node(policy->nodes);
 	} else {
 		/*
 		 * __GFP_THISNODE shouldn't even be used with the bind policy
@@ -1871,12 +1882,11 @@ static int policy_node(gfp_t gfp, struct mempolicy *policy, int nd)
 		 */
 		WARN_ON_ONCE(policy->mode == MPOL_BIND && (gfp & __GFP_THISNODE));
 	}
-
 	if ((policy->mode == MPOL_BIND ||
-	     policy->mode == MPOL_PREFERRED_MANY) &&
+	     policy->mode == MPOL_PREFERRED_MANY ||
+	     policy->mode == MPOL_PREFERRED_ORDER) &&
 	    policy->home_node != NUMA_NO_NODE)
 		return policy->home_node;
-
 	return nd;
 }
 
@@ -1917,6 +1927,7 @@ unsigned int mempolicy_slab_node(void)
 
 	case MPOL_BIND:
 	case MPOL_PREFERRED_MANY:
+	case MPOL_PREFERRED_ORDER:
 	{
 		struct zoneref *z;
 
@@ -2022,7 +2033,7 @@ int huge_node(struct vm_area_struct *vma, unsigned long addr, gfp_t gfp_flags,
 					huge_page_shift(hstate_vma(vma)));
 	} else {
 		nid = policy_node(gfp_flags, *mpol, numa_node_id());
-		if (mode == MPOL_BIND || mode == MPOL_PREFERRED_MANY)
+		if (mode == MPOL_BIND || mode == MPOL_PREFERRED_MANY || mode == MPOL_PREFERRED_ORDER)
 			*nodemask = &(*mpol)->nodes;
 	}
 	return nid;
@@ -2056,6 +2067,7 @@ bool init_nodemask_of_mempolicy(nodemask_t *mask)
 	switch (mempolicy->mode) {
 	case MPOL_PREFERRED:
 	case MPOL_PREFERRED_MANY:
+	case MPOL_PREFERRED_ORDER:
 	case MPOL_BIND:
 	case MPOL_INTERLEAVE:
 		*mask = mempolicy->nodes;
@@ -2142,6 +2154,37 @@ static struct page *alloc_pages_preferred_many(gfp_t gfp, unsigned int order,
 	return page;
 }
 
+static struct page *alloc_pages_preferred_order(gfp_t gfp, unsigned int order,
+						struct mempolicy *pol)
+{
+	struct page *page;
+	gfp_t strict_gfp;
+	int node;
+
+	/*
+	 * Try each node in the nodemask in order.
+	 * Skip direct reclaim on first pass through nodes.
+	 */
+	strict_gfp = gfp | __GFP_NOWARN;
+	strict_gfp &= ~(__GFP_DIRECT_RECLAIM | __GFP_NOFAIL);
+
+	/* First pass: try nodes in order without reclaim */
+	for_each_node_mask(node, pol->nodes) {
+		page = __alloc_pages(strict_gfp, order, node, NULL);
+		if (page)
+			return page;
+	}
+
+	/* Second pass: try nodes in order with full gfp flags */
+	for_each_node_mask(node, pol->nodes) {
+		page = __alloc_pages(gfp, order, node, NULL);
+		if (page)
+			return page;
+	}
+
+	return NULL;
+}
+
 /**
  * vma_alloc_folio - Allocate a folio for a VMA.
  * @gfp: GFP flags.
@@ -2188,6 +2231,17 @@ struct folio *vma_alloc_folio(gfp_t gfp, int order, struct vm_area_struct *vma,
 		node = policy_node(gfp, pol, node);
 		gfp |= __GFP_COMP;
 		page = alloc_pages_preferred_many(gfp, order, node, pol);
+		mpol_cond_put(pol);
+		if (page && order > 1)
+			prep_transhuge_page(page);
+		folio = (struct folio *)page;
+		goto out;
+	}
+	
+	if (pol->mode == MPOL_PREFERRED_ORDER) {
+		struct page *page;
+		gfp |= __GFP_COMP;
+		page = alloc_pages_preferred_order(gfp, order, pol);
 		mpol_cond_put(pol);
 		if (page && order > 1)
 			prep_transhuge_page(page);
@@ -2275,6 +2329,8 @@ struct page *alloc_pages(gfp_t gfp, unsigned order)
 	else if (pol->mode == MPOL_PREFERRED_MANY)
 		page = alloc_pages_preferred_many(gfp, order,
 				  policy_node(gfp, pol, numa_node_id()), pol);
+        else if (pol->mode == MPOL_PREFERRED_ORDER)
+		page = alloc_pages_preferred_order(gfp, order, pol);
 	else
 		page = __alloc_pages(gfp, order,
 				policy_node(gfp, pol, numa_node_id()),
@@ -2349,6 +2405,38 @@ static unsigned long alloc_pages_bulk_array_preferred_many(gfp_t gfp, int nid,
 	return nr_allocated;
 }
 
+static unsigned long alloc_pages_bulk_array_preferred_order(gfp_t gfp,
+		struct mempolicy *pol, unsigned long nr_pages,
+		struct page **page_array)
+{
+	gfp_t strict_gfp;
+	unsigned long nr_allocated = 0;
+	int node;
+
+	strict_gfp = gfp | __GFP_NOWARN;
+	strict_gfp &= ~(__GFP_DIRECT_RECLAIM | __GFP_NOFAIL);
+
+	/* First pass: try nodes in order without reclaim */
+	for_each_node_mask(node, pol->nodes) {
+		if (nr_allocated >= nr_pages)
+			break;
+		nr_allocated += __alloc_pages_bulk(strict_gfp, node, NULL,
+				nr_pages - nr_allocated, NULL,
+				page_array + nr_allocated);
+	}
+
+	/* Second pass: try nodes in order with full gfp flags */
+	for_each_node_mask(node, pol->nodes) {
+		if (nr_allocated >= nr_pages)
+			break;
+		nr_allocated += __alloc_pages_bulk(gfp, node, NULL,
+				nr_pages - nr_allocated, NULL,
+				page_array + nr_allocated);
+	}
+
+	return nr_allocated;
+}
+
 /* alloc pages bulk and mempolicy should be considered at the
  * same time in some situation such as vmalloc.
  *
@@ -2370,7 +2458,9 @@ unsigned long alloc_pages_bulk_array_mempolicy(gfp_t gfp,
 	if (pol->mode == MPOL_PREFERRED_MANY)
 		return alloc_pages_bulk_array_preferred_many(gfp,
 				numa_node_id(), pol, nr_pages, page_array);
-
+	if (pol->mode == MPOL_PREFERRED_ORDER)
+		return alloc_pages_bulk_array_preferred_order(gfp,
+				pol, nr_pages, page_array);
 	return __alloc_pages_bulk(gfp, policy_node(gfp, pol, numa_node_id()),
 				  policy_nodemask(gfp, pol), nr_pages, NULL,
 				  page_array);
@@ -2441,6 +2531,7 @@ bool __mpol_equal(struct mempolicy *a, struct mempolicy *b)
 	case MPOL_INTERLEAVE:
 	case MPOL_PREFERRED:
 	case MPOL_PREFERRED_MANY:
+	case MPOL_PREFERRED_ORDER:
 		return !!nodes_equal(a->nodes, b->nodes);
 	case MPOL_LOCAL:
 		return true;
@@ -2600,6 +2691,7 @@ int mpol_misplaced(struct page *page, struct vm_area_struct *vma, unsigned long 
 		fallthrough;
 
 	case MPOL_PREFERRED_MANY:
+	case MPOL_PREFERRED_ORDER:
 		/*
 		 * use current page if in policy nodemask,
 		 * else select nearest allowed node, if any.
@@ -2964,6 +3056,7 @@ static const char * const policy_modes[] =
 	[MPOL_INTERLEAVE] = "interleave",
 	[MPOL_LOCAL]      = "local",
 	[MPOL_PREFERRED_MANY]  = "prefer (many)",
+	[MPOL_PREFERRED_ORDER] = "prefer (order)",
 };
 
 
@@ -3043,6 +3136,7 @@ int mpol_parse_str(char *str, struct mempolicy **mpol)
 			err = 0;
 		goto out;
 	case MPOL_PREFERRED_MANY:
+	case MPOL_PREFERRED_ORDER:
 	case MPOL_BIND:
 		/*
 		 * Insist on a nodelist
@@ -3130,6 +3224,7 @@ void mpol_to_str(char *buffer, int maxlen, struct mempolicy *pol)
 		break;
 	case MPOL_PREFERRED:
 	case MPOL_PREFERRED_MANY:
+	case MPOL_PREFERRED_ORDER:
 	case MPOL_BIND:
 	case MPOL_INTERLEAVE:
 		nodes = pol->nodes;
