@@ -1497,6 +1497,13 @@ int pgtable_repl_enable(struct mm_struct *mm, nodemask_t nodes)
 
     smp_mb();
     smp_store_release(&mm->repl_in_progress, false);
+    
+    /*
+     * Disable cache_only_mode now that full replication is active.
+     * Full replication provides NUMA-local page tables across all nodes,
+     * which subsumes the benefits of cache-only mode.
+     */
+    WRITE_ONCE(mm->cache_only_mode, false);
 
     /* Capture process metadata for statistics */
     mm->mitosis_repl_start_time = ktime_get();
