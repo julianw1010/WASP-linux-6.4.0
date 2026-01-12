@@ -1,4 +1,4 @@
-# Mitosis+WASP: Workload-Aware Self-Replicating Page Tables
+# WASP: Workload-Aware Self-Replicating Page Tables
 
 A Linux 6.4 kernel implementation of NUMA-aware page table replication with workload-aware steering capabilities.
 
