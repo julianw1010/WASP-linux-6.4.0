@@ -1428,10 +1428,6 @@ int pgtable_repl_enable(struct mm_struct *mm, nodemask_t nodes)
 
     if (!mm || mm == &init_mm || nodes_empty(nodes) || nodes_weight(nodes) < 2)
         return -EINVAL;
-        
-    /* Cannot enable replication when cache-only mode is active */
-    if (mm->cache_only_mode)
-        return -EBUSY;
 
     for_each_node_mask(node, nodes) {
         if (!node_online(node))
