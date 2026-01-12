@@ -37,3 +37,5 @@ sudo apt install -y \
     wget
 
 cp wasp.config .config
+
+make olddefconfig
