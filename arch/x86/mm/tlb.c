@@ -1142,8 +1142,8 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 	 */
 	if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids) {
 #ifdef CONFIG_PGTABLE_REPLICATION
-		/* Track TLB shootdowns for Mitosis-enabled processes */
-		if (mm->repl_pgd_enabled) {
+		/* Track TLB shootdowns for Mitosis-enabled processes (replication or cache-only) */
+		if (mm->repl_pgd_enabled || mm->cache_only_mode) {
 			int ipis_sent = cpumask_weight(mm_cpumask(mm)) - 1; /* -1 for local CPU */
 			atomic64_inc(&mm->mitosis_tlb_shootdowns);
 			if (ipis_sent > 0)

@@ -1424,6 +1424,11 @@ void mmput(struct mm_struct *mm)
 			pgtable_repl_disable(mm);
 			WARN_ON_ONCE(mm->repl_pgd_enabled);
 			WARN_ON_ONCE(!nodes_empty(mm->repl_pgd_nodes));
+		} else if (mm->cache_only_mode && mm->mitosis_repl_start_time != 0) {
+			/* Record stats for cache-only mode on process exit */
+			mitosis_stats_record_mm(mm);
+			mm->cache_only_mode = false;
+			mm->mitosis_repl_start_time = 0;
 		}
 #endif
 		__mmput(mm);

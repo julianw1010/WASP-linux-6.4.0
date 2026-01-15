@@ -65,8 +65,10 @@ void mitosis_stats_record_mm(struct mm_struct *mm)
 	unsigned long flags;
 	int node;
 
-	if (!mm->repl_pgd_enabled && mm->mitosis_repl_start_time == 0)
-		return;
+	if (!mm->repl_pgd_enabled && !mm->cache_only_mode)
+            return;
+        if (mm->mitosis_repl_start_time == 0)
+            return;
 
 	stats = kmalloc(sizeof(*stats), GFP_KERNEL);
 	if (!stats)
@@ -138,8 +140,18 @@ static void show_process_detail(struct seq_file *m,
 	seq_puts(m, "================================================================================\n");
 	if (!is_live && seq_id > 0)
 		seq_printf(m, "History Entry #%llu\n", seq_id);
-	seq_printf(m, "Process: %s (PID: %d, TGID: %d) %s\n",
-		   comm, pid, tgid, is_live ? "[LIVE]" : "[HISTORICAL]");
+	{
+            const char *mode_str = "";
+            if (is_live) {
+                mode_str = "[LIVE]";
+            } else {
+                /* For historical entries, check if it was cache-only or full replication */
+                bool was_cache_only = nodes_empty(*repl_nodes);
+                mode_str = was_cache_only ? "[HISTORICAL - CACHE-ONLY]" : "[HISTORICAL - REPLICATED]";
+            }
+            seq_printf(m, "Process: %s (PID: %d, TGID: %d) %s\n",
+                   comm, pid, tgid, mode_str);
+        }
 	seq_printf(m, "Cmdline: %s\n", cmdline);
 	seq_printf(m, "Duration: %lld ms\n", duration_ms);
 
@@ -150,7 +162,11 @@ static void show_process_detail(struct seq_file *m,
 		seq_printf(m, "%d", node);
 		active_nodes++;
 	}
-	seq_printf(m, " (%d nodes)\n", active_nodes);
+	if (active_nodes == 0) {
+		seq_printf(m, "None (cache-only mode)\n");
+	} else {
+		seq_printf(m, " (%d nodes)\n", active_nodes);
+	}
 
 	seq_printf(m, "\nTLB Statistics:\n");
 	seq_printf(m, "  Shootdowns: %llu events\n", tlb_shootdowns);
@@ -381,7 +397,7 @@ static int mitosis_active_show(struct seq_file *m, void *v)
 	seq_puts(m, "===================================================\n\n");
 
 	seq_printf(m, "%-8s %-8s %-16s %12s %8s\n",
-		   "PID", "TGID", "COMM", "DURATION_MS", "NODES");
+         "PID", "TGID", "COMM", "DURATION_MS", "MODE");
 	seq_puts(m, "--------------------------------------------------------------------------------\n");
 
 	rcu_read_lock();
@@ -393,16 +409,22 @@ static int mitosis_active_show(struct seq_file *m, void *v)
 			continue;
 
 		mm = task->mm;
-		if (!mm || !mm->repl_pgd_enabled)
-			continue;
+                if (!mm || (!mm->repl_pgd_enabled && !mm->cache_only_mode))
+                    continue;
 
-		found++;
-		duration_ms = ktime_ms_delta(ktime_get(), mm->mitosis_repl_start_time);
-		node_count = nodes_weight(mm->repl_pgd_nodes);
+                found++;
+                duration_ms = ktime_ms_delta(ktime_get(), mm->mitosis_repl_start_time);
+                node_count = mm->repl_pgd_enabled ? nodes_weight(mm->repl_pgd_nodes) : 0;
 
-		seq_printf(m, "%-8d %-8d %-16s %12lld %8d\n",
-			   task->pid, task->tgid, task->comm,
-			   duration_ms, node_count);
+                if (mm->cache_only_mode && !mm->repl_pgd_enabled) {
+			seq_printf(m, "%-8d %-8d %-16s %12lld %8s\n",
+				   task->pid, task->tgid, task->comm,
+				   duration_ms, "CACHE");
+		} else {
+			seq_printf(m, "%-8d %-8d %-16s %12lld %8d\n",
+				   task->pid, task->tgid, task->comm,
+				   duration_ms, node_count);
+		}
 	}
 	rcu_read_unlock();
 
@@ -563,7 +585,7 @@ static int mitosis_status_show(struct seq_file *m, void *v)
 	/* Process summary */
 	{
 		struct task_struct *p;
-		int total = 0, replicated = 0;
+		int total = 0, replicated = 0, cache_only = 0;
 
 		rcu_read_lock();
 		for_each_process(p) {
@@ -575,15 +597,20 @@ static int mitosis_status_show(struct seq_file *m, void *v)
 			total++;
 			if (mm->repl_pgd_enabled)
 				replicated++;
+			else if (mm->cache_only_mode)
+				cache_only++;
 		}
 		rcu_read_unlock();
 
 		seq_printf(m, "\nProcess Summary:\n");
 		seq_printf(m, "  Total processes: %d\n", total);
 		seq_printf(m, "  With replication: %d\n", replicated);
+		seq_printf(m, "  Cache-only mode: %d\n", cache_only);
 
 		if (replicated > 0)
 			seq_printf(m, "\nReplication is ACTIVE\n");
+		else if (cache_only > 0)
+			seq_printf(m, "\nCache-only mode is ACTIVE\n");
 		else
 			seq_printf(m, "\nReplication is INACTIVE\n");
 

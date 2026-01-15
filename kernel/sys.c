@@ -68,6 +68,7 @@
 #ifdef CONFIG_PGTABLE_REPLICATION
 #include <asm/pgtable_repl.h>
 #include <asm/tlbflush.h>
+#include <linux/mitosis_stats.h>
 #endif
 
 #include <linux/nospec.h>
@@ -2892,8 +2893,31 @@ case PR_SET_PGTABLE_REPL:
 			break;
 		}
 
-		WRITE_ONCE(mm->cache_only_mode, enable);
-		error = 0;
+		/* Record stats when disabling cache-only mode */
+                if (!enable && mm->cache_only_mode && mm->mitosis_repl_start_time != 0) {
+                    mitosis_stats_record_mm(mm);
+                }
+
+                WRITE_ONCE(mm->cache_only_mode, enable);
+
+                /* Capture process metadata when enabling cache-only mode */
+                if (enable && mm->mitosis_repl_start_time == 0) {
+                    mm->mitosis_repl_start_time = ktime_get();
+                    mm->mitosis_owner_pid = task->pid;
+                    mm->mitosis_owner_tgid = task->tgid;
+                    get_task_comm(mm->mitosis_owner_comm, task);
+                    {
+                        int len, i;
+                        len = get_cmdline(task, mm->mitosis_cmdline, 255);
+                        mm->mitosis_cmdline[len] = '\0';
+                        for (i = 0; i < len; i++) {
+                            if (mm->mitosis_cmdline[i] == '\0')
+                                mm->mitosis_cmdline[i] = ' ';
+                        }
+                    }
+                }
+
+                error = 0;
 
 		mmput(mm);
 		if (!is_self && task)
