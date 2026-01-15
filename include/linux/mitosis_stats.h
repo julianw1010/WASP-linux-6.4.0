@@ -36,6 +36,12 @@ struct mitosis_mm_stats {
 	u64 pgtable_max_pud[NUMA_NODE_COUNT];
 	u64 pgtable_max_p4d[NUMA_NODE_COUNT];
 	u64 pgtable_max_pgd[NUMA_NODE_COUNT];
+	/* Peak populated entry counts per node */
+	u64 pgtable_max_entries_pte[NUMA_NODE_COUNT];
+	u64 pgtable_max_entries_pmd[NUMA_NODE_COUNT];
+	u64 pgtable_max_entries_pud[NUMA_NODE_COUNT];
+	u64 pgtable_max_entries_p4d[NUMA_NODE_COUNT];
+	u64 pgtable_max_entries_pgd[NUMA_NODE_COUNT];
 	nodemask_t repl_nodes;
 };
 

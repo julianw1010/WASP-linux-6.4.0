@@ -274,6 +274,88 @@ static inline void track_replica_free(atomic64_t *current_count)
 }
 
 /*
+ * Helper to track entry population changes and update max counts.
+ * Called when an entry transitions between zero and non-zero.
+ */
+static inline void track_entry_count_change(struct mm_struct *mm, int node,
+                                            atomic64_t *current_count,
+                                            atomic64_t *max_count,
+                                            bool is_increment)
+{
+	s64 cur, max;
+	
+	if (!mm || mm == &init_mm || node < 0 || node >= NUMA_NODE_COUNT)
+		return;
+	
+	if (is_increment) {
+		cur = atomic64_inc_return(current_count);
+		max = atomic64_read(max_count);
+		while (cur > max) {
+			if (atomic64_cmpxchg(max_count, max, cur) == max)
+				break;
+			max = atomic64_read(max_count);
+		}
+	} else {
+		atomic64_dec(current_count);
+	}
+}
+
+/*
+ * Track PTE entry population change
+ */
+static inline void track_pte_entry(struct mm_struct *mm, int node, bool is_increment)
+{
+	if (!mm || mm == &init_mm)
+		return;
+	track_entry_count_change(mm, node, &mm->pgtable_entries_pte[node],
+	                         &mm->pgtable_max_entries_pte[node], is_increment);
+}
+
+/*
+ * Track PMD entry population change
+ */
+static inline void track_pmd_entry(struct mm_struct *mm, int node, bool is_increment)
+{
+	if (!mm || mm == &init_mm)
+		return;
+	track_entry_count_change(mm, node, &mm->pgtable_entries_pmd[node],
+	                         &mm->pgtable_max_entries_pmd[node], is_increment);
+}
+
+/*
+ * Track PUD entry population change
+ */
+static inline void track_pud_entry(struct mm_struct *mm, int node, bool is_increment)
+{
+	if (!mm || mm == &init_mm)
+		return;
+	track_entry_count_change(mm, node, &mm->pgtable_entries_pud[node],
+	                         &mm->pgtable_max_entries_pud[node], is_increment);
+}
+
+/*
+ * Track P4D entry population change
+ */
+static inline void track_p4d_entry(struct mm_struct *mm, int node, bool is_increment)
+{
+	if (!mm || mm == &init_mm)
+		return;
+	track_entry_count_change(mm, node, &mm->pgtable_entries_p4d[node],
+	                         &mm->pgtable_max_entries_p4d[node], is_increment);
+}
+
+/*
+ * Track PGD entry population change
+ */
+static inline void track_pgd_entry(struct mm_struct *mm, int node, bool is_increment)
+{
+	if (!mm || mm == &init_mm)
+		return;
+	track_entry_count_change(mm, node, &mm->pgtable_entries_pgd[node],
+	                         &mm->pgtable_max_entries_pgd[node], is_increment);
+}
+
+/*
  * mitosis_alloc_replica_page - Unified page allocation for replicas
  * @node: Target NUMA node
  * @order: Allocation order (0 for PTE/PMD/PUD/P4D, may be 1 for PGD with PTI)
@@ -586,6 +668,7 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     struct page *start_page;
     unsigned long offset;
     unsigned long ptep_addr;
+    struct mm_struct *mm = NULL;
 
     if (!ptep) {
         native_set_pte(ptep, pteval);
@@ -615,13 +698,35 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     else
         atomic_inc(&repl_pte_sets);
 
+    /* Try to get mm_struct from current task for entry tracking */
+    if (current && current->mm && current->mm != &init_mm)
+        mm = current->mm;
+
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
     start_page = pte_page;
     cur_page = pte_page;
 
     do {
         pte_t *replica_entry = (pte_t *)(page_address(cur_page) + offset);
+        pte_t old_val = READ_ONCE(*replica_entry);
+        int node = page_to_nid(cur_page);
+        
         WRITE_ONCE(*replica_entry, pteval);
+        
+        /* Track entry population changes if we have mm context */
+        if (mm && node >= 0 && node < NUMA_NODE_COUNT) {
+            bool was_populated = (pte_val(old_val) != 0);
+            bool is_populated = (pte_val(pteval) != 0);
+            
+            if (!was_populated && is_populated) {
+                /* Entry became populated */
+                track_pte_entry(mm, node, true);
+            } else if (was_populated && !is_populated) {
+                /* Entry became empty */
+                track_pte_entry(mm, node, false);
+            }
+        }
+        
         cur_page = READ_ONCE(cur_page->pt_replica);
     } while (cur_page && cur_page != start_page);
 
@@ -640,6 +745,7 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
     bool has_child;
     bool child_has_replicas = false;
     unsigned long pmdp_addr;
+    struct mm_struct *mm = NULL;
 
     if (!pmdp) {
         native_set_pmd(pmdp, pmdval);
@@ -679,12 +785,17 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
         child_has_replicas = (READ_ONCE(child_base_page->pt_replica) != NULL);
     }
 
+    /* Try to get mm_struct from current task for entry tracking */
+    if (current && current->mm && current->mm != &init_mm)
+        mm = current->mm;
+
     offset = ((unsigned long)pmdp) & ~PAGE_MASK;
     start_page = parent_page;
     cur_page = parent_page;
 
     do {
         pmd_t *replica_entry = (pmd_t *)(page_address(cur_page) + offset);
+        pmd_t old_val = READ_ONCE(*replica_entry);
         unsigned long node_val;
         int node = page_to_nid(cur_page);
 
@@ -701,6 +812,19 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
         }
 
         WRITE_ONCE(*replica_entry, __pmd(node_val));
+        
+        /* Track entry population changes if we have mm context */
+        if (mm && node >= 0 && node < NUMA_NODE_COUNT) {
+            bool was_populated = (pmd_val(old_val) != 0);
+            bool is_populated = (node_val != 0);
+            
+            if (!was_populated && is_populated) {
+                track_pmd_entry(mm, node, true);
+            } else if (was_populated && !is_populated) {
+                track_pmd_entry(mm, node, false);
+            }
+        }
+        
         cur_page = READ_ONCE(cur_page->pt_replica);
     } while (cur_page && cur_page != start_page);
 
@@ -719,6 +843,7 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
     bool has_child;
     bool child_has_replicas = false;
     unsigned long pudp_addr;
+    struct mm_struct *mm = NULL;
 
     if (!pudp) {
         native_set_pud(pudp, pudval);
@@ -758,12 +883,17 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
         child_has_replicas = (READ_ONCE(child_base_page->pt_replica) != NULL);
     }
 
+    /* Try to get mm_struct from current task for entry tracking */
+    if (current && current->mm && current->mm != &init_mm)
+        mm = current->mm;
+
     offset = ((unsigned long)pudp) & ~PAGE_MASK;
     start_page = parent_page;
     cur_page = parent_page;
 
     do {
         pud_t *replica_entry = (pud_t *)(page_address(cur_page) + offset);
+        pud_t old_val = READ_ONCE(*replica_entry);
         unsigned long node_val;
         int node = page_to_nid(cur_page);
 
@@ -780,6 +910,19 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
         }
 
         WRITE_ONCE(*replica_entry, __pud(node_val));
+        
+        /* Track entry population changes if we have mm context */
+        if (mm && node >= 0 && node < NUMA_NODE_COUNT) {
+            bool was_populated = (pud_val(old_val) != 0);
+            bool is_populated = (node_val != 0);
+            
+            if (!was_populated && is_populated) {
+                track_pud_entry(mm, node, true);
+            } else if (was_populated && !is_populated) {
+                track_pud_entry(mm, node, false);
+            }
+        }
+        
         cur_page = READ_ONCE(cur_page->pt_replica);
     } while (cur_page && cur_page != start_page);
 
@@ -798,6 +941,7 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
     bool has_child;
     bool child_has_replicas = false;
     unsigned long p4dp_addr;
+    struct mm_struct *mm = NULL;
 
     if (!p4dp) {
         native_set_p4d(p4dp, p4dval);
@@ -837,12 +981,17 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
         child_has_replicas = (READ_ONCE(child_base_page->pt_replica) != NULL);
     }
 
+    /* Try to get mm_struct from current task for entry tracking */
+    if (current && current->mm && current->mm != &init_mm)
+        mm = current->mm;
+
     offset = ((unsigned long)p4dp) & ~PAGE_MASK;
     start_page = parent_page;
     cur_page = parent_page;
 
     do {
         p4d_t *replica_entry = (p4d_t *)(page_address(cur_page) + offset);
+        p4d_t old_val = READ_ONCE(*replica_entry);
         unsigned long node_val;
         int node = page_to_nid(cur_page);
 
@@ -859,6 +1008,19 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
         }
 
         WRITE_ONCE(*replica_entry, __p4d(node_val));
+        
+        /* Track entry population changes if we have mm context */
+        if (mm && node >= 0 && node < NUMA_NODE_COUNT) {
+            bool was_populated = (p4d_val(old_val) != 0);
+            bool is_populated = (node_val != 0);
+            
+            if (!was_populated && is_populated) {
+                track_p4d_entry(mm, node, true);
+            } else if (was_populated && !is_populated) {
+                track_p4d_entry(mm, node, false);
+            }
+        }
+        
         cur_page = READ_ONCE(cur_page->pt_replica);
     } while (cur_page && cur_page != start_page);
 
@@ -877,6 +1039,7 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
     bool has_child;
     bool child_has_replicas = false;
     unsigned long pgdp_addr;
+    struct mm_struct *mm = NULL;
 
     if (!pgdp) {
         native_set_pgd(pgdp, pgdval);
@@ -916,12 +1079,17 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
         child_has_replicas = (READ_ONCE(child_base_page->pt_replica) != NULL);
     }
 
+    /* Try to get mm_struct from current task for entry tracking */
+    if (current && current->mm && current->mm != &init_mm)
+        mm = current->mm;
+
     offset = ((unsigned long)pgdp) & ~PAGE_MASK;
     start_page = parent_page;
     cur_page = parent_page;
 
     do {
         pgd_t *replica_entry = (pgd_t *)(page_address(cur_page) + offset);
+        pgd_t old_val = READ_ONCE(*replica_entry);
         unsigned long node_val;
         int node = page_to_nid(cur_page);
 
@@ -944,7 +1112,19 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
             if (user_entry)
                 WRITE_ONCE(*user_entry, __pgd(node_val));
         }
-
+        
+        /* Track entry population changes if we have mm context */
+        if (mm && node >= 0 && node < NUMA_NODE_COUNT) {
+            bool was_populated = (pgd_val(old_val) != 0);
+            bool is_populated = (node_val != 0);
+            
+            if (!was_populated && is_populated) {
+                track_pgd_entry(mm, node, true);
+            } else if (was_populated && !is_populated) {
+                track_pgd_entry(mm, node, false);
+            }
+        }
+        
         cur_page = READ_ONCE(cur_page->pt_replica);
     } while (cur_page && cur_page != start_page);
 
@@ -2248,7 +2428,17 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep)
     do {
         pte_t *replica_entry = (pte_t *)(page_address(cur_page) + offset);
         pte_t old_pte = native_ptep_get_and_clear(replica_entry);
+        int node = page_to_nid(cur_page);
+        
         val |= pte_val(old_pte);
+        
+        /* Track entry being cleared if we have mm context */
+        if (mm && mm != &init_mm && pte_val(old_pte) != 0) {
+            if (node >= 0 && node < NUMA_NODE_COUNT) {
+                track_pte_entry(mm, node, false);
+            }
+        }
+        
         cur_page = READ_ONCE(cur_page->pt_replica);
     } while (cur_page && cur_page != start_page);
 

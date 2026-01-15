@@ -96,6 +96,12 @@ void mitosis_stats_record_mm(struct mm_struct *mm)
 		stats->pgtable_max_pud[node] = atomic_read(&mm->pgtable_max_pud[node]);
 		stats->pgtable_max_p4d[node] = atomic_read(&mm->pgtable_max_p4d[node]);
 		stats->pgtable_max_pgd[node] = atomic_read(&mm->pgtable_max_pgd[node]);
+		/* Snapshot peak entry counts */
+		stats->pgtable_max_entries_pte[node] = atomic64_read(&mm->pgtable_max_entries_pte[node]);
+		stats->pgtable_max_entries_pmd[node] = atomic64_read(&mm->pgtable_max_entries_pmd[node]);
+		stats->pgtable_max_entries_pud[node] = atomic64_read(&mm->pgtable_max_entries_pud[node]);
+		stats->pgtable_max_entries_p4d[node] = atomic64_read(&mm->pgtable_max_entries_p4d[node]);
+		stats->pgtable_max_entries_pgd[node] = atomic64_read(&mm->pgtable_max_entries_pgd[node]);
 	}
 
 	spin_lock_irqsave(&mitosis_stats_lock, flags);
@@ -124,6 +130,8 @@ static void show_process_detail(struct seq_file *m,
 				u64 max_pmd[], u64 max_pte[],
 				u64 peak_pte[], u64 peak_pmd[], u64 peak_pud[],
 				u64 peak_p4d[], u64 peak_pgd[],
+				u64 entries_pte[], u64 entries_pmd[], u64 entries_pud[],
+				u64 entries_p4d[], u64 entries_pgd[],
 				nodemask_t *repl_nodes, bool is_live)
 {
 	int node;
@@ -173,94 +181,104 @@ static void show_process_detail(struct seq_file *m,
 	seq_printf(m, "  IPIs sent:  %llu\n", tlb_ipis_sent);
 
 	/* Integrated table header */
-	seq_puts(m, "\nPeak Page Table Allocations (primary/replica):\n");
+	seq_puts(m, "\nPeak Page Table Allocations (primary/replica) [entries]:\n");
 
 	seq_printf(m, "%-8s", "LEVEL");
 	for_each_online_node(node) {
 		if (node < NUMA_NODE_COUNT)
-			seq_printf(m, "  %10s%-2d", "NODE", node);
+			seq_printf(m, "  %16s%-2d", "NODE", node);
 	}
-	seq_printf(m, "  %12s\n", "TOTAL");
+	seq_printf(m, "  %20s\n", "TOTAL");
 	seq_puts(m, "--------------------------------------------------------------------------------\n");
 
 	/* PGD row */
 	{
-		u64 total_primary = 0, total_replica = 0;
+		u64 total_primary = 0, total_replica = 0, total_entries = 0;
 		seq_printf(m, "%-8s", "PGD");
 		for_each_online_node(node) {
 			if (node < NUMA_NODE_COUNT) {
 				u64 primary = peak_pgd[node];
 				u64 replica = max_pgd[node];
-				seq_printf(m, "  %5llu/%-6llu", primary, replica);
+				u64 entries = entries_pgd[node];
+				seq_printf(m, "  %5llu/%-6llu [%4llu]", primary, replica, entries);
 				total_primary += primary;
 				total_replica += replica;
+				total_entries += entries;
 			}
 		}
-		seq_printf(m, "  %5llu/%-6llu\n", total_primary, total_replica);
+		seq_printf(m, "  %5llu/%-6llu [%4llu]\n", total_primary, total_replica, total_entries);
 	}
 
 	/* P4D row */
 	{
-		u64 total_primary = 0, total_replica = 0;
+		u64 total_primary = 0, total_replica = 0, total_entries = 0;
 		seq_printf(m, "%-8s", "P4D");
 		for_each_online_node(node) {
 			if (node < NUMA_NODE_COUNT) {
 				u64 primary = peak_p4d[node];
 				u64 replica = max_p4d[node];
-				seq_printf(m, "  %5llu/%-6llu", primary, replica);
+				u64 entries = entries_p4d[node];
+				seq_printf(m, "  %5llu/%-6llu [%4llu]", primary, replica, entries);
 				total_primary += primary;
 				total_replica += replica;
+				total_entries += entries;
 			}
 		}
-		seq_printf(m, "  %5llu/%-6llu\n", total_primary, total_replica);
+		seq_printf(m, "  %5llu/%-6llu [%4llu]\n", total_primary, total_replica, total_entries);
 	}
 
 	/* PUD row */
 	{
-		u64 total_primary = 0, total_replica = 0;
+		u64 total_primary = 0, total_replica = 0, total_entries = 0;
 		seq_printf(m, "%-8s", "PUD");
 		for_each_online_node(node) {
 			if (node < NUMA_NODE_COUNT) {
 				u64 primary = peak_pud[node];
 				u64 replica = max_pud[node];
-				seq_printf(m, "  %5llu/%-6llu", primary, replica);
+				u64 entries = entries_pud[node];
+				seq_printf(m, "  %5llu/%-6llu [%4llu]", primary, replica, entries);
 				total_primary += primary;
 				total_replica += replica;
+				total_entries += entries;
 			}
 		}
-		seq_printf(m, "  %5llu/%-6llu\n", total_primary, total_replica);
+		seq_printf(m, "  %5llu/%-6llu [%4llu]\n", total_primary, total_replica, total_entries);
 	}
 
 	/* PMD row */
 	{
-		u64 total_primary = 0, total_replica = 0;
+		u64 total_primary = 0, total_replica = 0, total_entries = 0;
 		seq_printf(m, "%-8s", "PMD");
 		for_each_online_node(node) {
 			if (node < NUMA_NODE_COUNT) {
 				u64 primary = peak_pmd[node];
 				u64 replica = max_pmd[node];
-				seq_printf(m, "  %5llu/%-6llu", primary, replica);
+				u64 entries = entries_pmd[node];
+				seq_printf(m, "  %5llu/%-6llu [%4llu]", primary, replica, entries);
 				total_primary += primary;
 				total_replica += replica;
+				total_entries += entries;
 			}
 		}
-		seq_printf(m, "  %5llu/%-6llu\n", total_primary, total_replica);
+		seq_printf(m, "  %5llu/%-6llu [%4llu]\n", total_primary, total_replica, total_entries);
 	}
 
 	/* PTE row */
 	{
-		u64 total_primary = 0, total_replica = 0;
+		u64 total_primary = 0, total_replica = 0, total_entries = 0;
 		seq_printf(m, "%-8s", "PTE");
 		for_each_online_node(node) {
 			if (node < NUMA_NODE_COUNT) {
 				u64 primary = peak_pte[node];
 				u64 replica = max_pte[node];
-				seq_printf(m, "  %5llu/%-6llu", primary, replica);
+				u64 entries = entries_pte[node];
+				seq_printf(m, "  %5llu/%-6llu [%4llu]", primary, replica, entries);
 				total_primary += primary;
 				total_replica += replica;
+				total_entries += entries;
 			}
 		}
-		seq_printf(m, "  %5llu/%-6llu\n", total_primary, total_replica);
+		seq_printf(m, "  %5llu/%-6llu [%4llu]\n", total_primary, total_replica, total_entries);
 	}
 
 	/* Summary - account for PTI's order-1 PGD allocations */
@@ -321,6 +339,9 @@ static int mitosis_history_show(struct seq_file *m, void *v)
 				    stats->pgtable_max_pte, stats->pgtable_max_pmd,
 				    stats->pgtable_max_pud, stats->pgtable_max_p4d,
 				    stats->pgtable_max_pgd,
+				    stats->pgtable_max_entries_pte, stats->pgtable_max_entries_pmd,
+				    stats->pgtable_max_entries_pud, stats->pgtable_max_entries_p4d,
+				    stats->pgtable_max_entries_pgd,
 				    &stats->repl_nodes, false);
 	}
 
@@ -396,42 +417,67 @@ static int mitosis_active_show(struct seq_file *m, void *v)
 	seq_puts(m, "Mitosis Page Table Replication - Active Processes\n");
 	seq_puts(m, "===================================================\n\n");
 
-	seq_printf(m, "%-8s %-8s %-16s %12s %8s\n",
-         "PID", "TGID", "COMM", "DURATION_MS", "MODE");
-	seq_puts(m, "--------------------------------------------------------------------------------\n");
-
 	rcu_read_lock();
 	for_each_process(task) {
-		s64 duration_ms;
-		int node_count = 0;
+		u64 max_pgd[NUMA_NODE_COUNT], max_p4d[NUMA_NODE_COUNT];
+		u64 max_pud[NUMA_NODE_COUNT], max_pmd[NUMA_NODE_COUNT], max_pte[NUMA_NODE_COUNT];
+		u64 peak_pgd[NUMA_NODE_COUNT], peak_p4d[NUMA_NODE_COUNT];
+		u64 peak_pud[NUMA_NODE_COUNT], peak_pmd[NUMA_NODE_COUNT], peak_pte[NUMA_NODE_COUNT];
+		u64 entries_pgd[NUMA_NODE_COUNT], entries_p4d[NUMA_NODE_COUNT];
+		u64 entries_pud[NUMA_NODE_COUNT], entries_pmd[NUMA_NODE_COUNT], entries_pte[NUMA_NODE_COUNT];
+		u64 tlb_shootdowns, tlb_ipis_sent;
+		nodemask_t repl_nodes;
+		ktime_t start_time;
+		int node;
 
 		if (task->pid != task->tgid)
 			continue;
 
 		mm = task->mm;
-                if (!mm || (!mm->repl_pgd_enabled && !mm->cache_only_mode))
-                    continue;
+		if (!mm || (!mm->repl_pgd_enabled && !mm->cache_only_mode))
+			continue;
 
-                found++;
-                duration_ms = ktime_ms_delta(ktime_get(), mm->mitosis_repl_start_time);
-                node_count = mm->repl_pgd_enabled ? nodes_weight(mm->repl_pgd_nodes) : 0;
+		found++;
 
-                if (mm->cache_only_mode && !mm->repl_pgd_enabled) {
-			seq_printf(m, "%-8d %-8d %-16s %12lld %8s\n",
-				   task->pid, task->tgid, task->comm,
-				   duration_ms, "CACHE");
-		} else {
-			seq_printf(m, "%-8d %-8d %-16s %12lld %8d\n",
-				   task->pid, task->tgid, task->comm,
-				   duration_ms, node_count);
+		/* Snapshot current state */
+		start_time = mm->mitosis_repl_start_time;
+		tlb_shootdowns = atomic64_read(&mm->mitosis_tlb_shootdowns);
+		tlb_ipis_sent = atomic64_read(&mm->mitosis_tlb_ipis_sent);
+		repl_nodes = mm->repl_pgd_nodes;
+
+		for (node = 0; node < NUMA_NODE_COUNT; node++) {
+			max_pgd[node] = atomic64_read(&mm->mitosis_max_pgd_replicas[node]);
+			max_p4d[node] = atomic64_read(&mm->mitosis_max_p4d_replicas[node]);
+			max_pud[node] = atomic64_read(&mm->mitosis_max_pud_replicas[node]);
+			max_pmd[node] = atomic64_read(&mm->mitosis_max_pmd_replicas[node]);
+			max_pte[node] = atomic64_read(&mm->mitosis_max_pte_replicas[node]);
+
+			peak_pgd[node] = atomic_read(&mm->pgtable_max_pgd[node]);
+			peak_p4d[node] = atomic_read(&mm->pgtable_max_p4d[node]);
+			peak_pud[node] = atomic_read(&mm->pgtable_max_pud[node]);
+			peak_pmd[node] = atomic_read(&mm->pgtable_max_pmd[node]);
+			peak_pte[node] = atomic_read(&mm->pgtable_max_pte[node]);
+
+			entries_pgd[node] = atomic64_read(&mm->pgtable_max_entries_pgd[node]);
+			entries_p4d[node] = atomic64_read(&mm->pgtable_max_entries_p4d[node]);
+			entries_pud[node] = atomic64_read(&mm->pgtable_max_entries_pud[node]);
+			entries_pmd[node] = atomic64_read(&mm->pgtable_max_entries_pmd[node]);
+			entries_pte[node] = atomic64_read(&mm->pgtable_max_entries_pte[node]);
 		}
+
+		show_process_detail(m, task->comm, task->pid, task->tgid,
+				    mm->mitosis_cmdline, 0,
+				    start_time, ktime_get(),
+				    tlb_shootdowns, tlb_ipis_sent,
+				    max_pgd, max_p4d, max_pud, max_pmd, max_pte,
+				    peak_pte, peak_pmd, peak_pud, peak_p4d, peak_pgd,
+				    entries_pte, entries_pmd, entries_pud, entries_p4d, entries_pgd,
+				    &repl_nodes, true);
 	}
 	rcu_read_unlock();
 
 	if (!found)
 		seq_puts(m, "(No active processes with replication enabled)\n");
-	else
-		seq_printf(m, "\nTotal: %d active process(es)\n", found);
 
 	return 0;
 }

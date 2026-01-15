@@ -621,7 +621,7 @@ struct mm_struct {
 		spinlock_t repl_alloc_lock;      /* Spinlock for atomic context */
 		pgd_t *pgd_replicas[NUMA_NODE_COUNT]; /* Per-node PGD replicas */
 		pgd_t *original_pgd;             /* Original primary PGD */
-				/*
+		/*
 		 * Steering matrix: maps physical NUMA node to optimal replica node.
 		 * Value of -1 means "use local node" (auto mode).
 		 * Set by userspace via prctl(PR_SET_PGTABLE_REPL_STEERING).
@@ -642,6 +642,21 @@ struct mm_struct {
 		atomic_t pgtable_max_pud[NUMA_NODE_COUNT];
 		atomic_t pgtable_max_p4d[NUMA_NODE_COUNT];
 		atomic_t pgtable_max_pgd[NUMA_NODE_COUNT];
+		
+		/* NEW: Populated entry counts per node */
+		/* Current populated entry counts */
+		atomic64_t pgtable_entries_pte[NUMA_NODE_COUNT];
+		atomic64_t pgtable_entries_pmd[NUMA_NODE_COUNT];
+		atomic64_t pgtable_entries_pud[NUMA_NODE_COUNT];
+		atomic64_t pgtable_entries_p4d[NUMA_NODE_COUNT];
+		atomic64_t pgtable_entries_pgd[NUMA_NODE_COUNT];
+		
+		/* Peak populated entry counts */
+		atomic64_t pgtable_max_entries_pte[NUMA_NODE_COUNT];
+		atomic64_t pgtable_max_entries_pmd[NUMA_NODE_COUNT];
+		atomic64_t pgtable_max_entries_pud[NUMA_NODE_COUNT];
+		atomic64_t pgtable_max_entries_p4d[NUMA_NODE_COUNT];
+		atomic64_t pgtable_max_entries_pgd[NUMA_NODE_COUNT];
 		
 	        /* Mitosis statistics tracking */
 		atomic64_t mitosis_tlb_shootdowns;      /* Total TLB shootdown events */

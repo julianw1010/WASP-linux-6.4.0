@@ -161,6 +161,8 @@ void pgtable_repl_ptep_set_wrprotect(struct mm_struct *mm,
                                      unsigned long addr, pte_t *ptep);
 int pgtable_repl_ptep_test_and_clear_young(struct vm_area_struct *vma,
                                            unsigned long addr, pte_t *ptep);
+                                           
+void count_existing_entries(struct mm_struct *mm);
 
 #ifdef CONFIG_PAGE_TABLE_ISOLATION
 static inline bool mitosis_pti_active(void)

@@ -1322,6 +1322,19 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 		atomic_set(&mm->pgtable_max_pud[i], 0);
 		atomic_set(&mm->pgtable_max_p4d[i], 0);
 		atomic_set(&mm->pgtable_max_pgd[i], 0);
+		
+                /* NEW: Initialize entry counts */
+		atomic64_set(&mm->pgtable_entries_pte[i], 0);
+		atomic64_set(&mm->pgtable_entries_pmd[i], 0);
+		atomic64_set(&mm->pgtable_entries_pud[i], 0);
+		atomic64_set(&mm->pgtable_entries_p4d[i], 0);
+		atomic64_set(&mm->pgtable_entries_pgd[i], 0);
+		
+		atomic64_set(&mm->pgtable_max_entries_pte[i], 0);
+		atomic64_set(&mm->pgtable_max_entries_pmd[i], 0);
+		atomic64_set(&mm->pgtable_max_entries_pud[i], 0);
+		atomic64_set(&mm->pgtable_max_entries_p4d[i], 0);
+		atomic64_set(&mm->pgtable_max_entries_pgd[i], 0);
 	}
 	/* Initialize statistics fields */
 	atomic64_set(&mm->mitosis_tlb_shootdowns, 0);
