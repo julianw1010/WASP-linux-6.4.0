@@ -20,6 +20,8 @@
 
 #ifdef CONFIG_PGTABLE_REPLICATION
 
+static bool mitosis_tracking_initialized = false;
+
 atomic_t total_cr3_writes = ATOMIC_INIT(0);
 atomic_t replica_hits = ATOMIC_INIT(0);
 atomic_t primary_hits = ATOMIC_INIT(0);
@@ -71,6 +73,9 @@ void mitosis_cache_init(void)
 	}
 
 	pr_info("MITOSIS: Page table cache initialized\n");
+	
+	smp_wmb(); /* Ensure cache init completes before enabling tracking */
+	mitosis_tracking_initialized = true;
 }
 EXPORT_SYMBOL(mitosis_cache_init);
 
@@ -698,9 +703,9 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     else
         atomic_inc(&repl_pte_sets);
 
-    /* Try to get mm_struct from current task for entry tracking */
-    if (current && current->mm && current->mm != &init_mm)
-        mm = current->mm;
+    /* Get mm_struct from page owner for entry tracking */
+    if (mitosis_tracking_initialized)
+        mm = READ_ONCE(pte_page->pt_owner_mm);
 
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
     start_page = pte_page;
@@ -714,7 +719,7 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
         WRITE_ONCE(*replica_entry, pteval);
         
         /* Track entry population changes if we have mm context */
-        if (mm && node >= 0 && node < NUMA_NODE_COUNT) {
+        if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT) {
             bool was_populated = (pte_val(old_val) != 0);
             bool is_populated = (pte_val(pteval) != 0);
             
@@ -785,9 +790,9 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
         child_has_replicas = (READ_ONCE(child_base_page->pt_replica) != NULL);
     }
 
-    /* Try to get mm_struct from current task for entry tracking */
-    if (current && current->mm && current->mm != &init_mm)
-        mm = current->mm;
+    /* Get mm_struct from page owner for entry tracking */
+    if (mitosis_tracking_initialized)
+        mm = READ_ONCE(parent_page->pt_owner_mm);
 
     offset = ((unsigned long)pmdp) & ~PAGE_MASK;
     start_page = parent_page;
@@ -814,7 +819,7 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
         WRITE_ONCE(*replica_entry, __pmd(node_val));
         
         /* Track entry population changes if we have mm context */
-        if (mm && node >= 0 && node < NUMA_NODE_COUNT) {
+        if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT) {
             bool was_populated = (pmd_val(old_val) != 0);
             bool is_populated = (node_val != 0);
             
@@ -883,9 +888,9 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
         child_has_replicas = (READ_ONCE(child_base_page->pt_replica) != NULL);
     }
 
-    /* Try to get mm_struct from current task for entry tracking */
-    if (current && current->mm && current->mm != &init_mm)
-        mm = current->mm;
+    /* Get mm_struct from page owner for entry tracking */
+    if (mitosis_tracking_initialized)
+        mm = READ_ONCE(parent_page->pt_owner_mm);
 
     offset = ((unsigned long)pudp) & ~PAGE_MASK;
     start_page = parent_page;
@@ -912,7 +917,7 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
         WRITE_ONCE(*replica_entry, __pud(node_val));
         
         /* Track entry population changes if we have mm context */
-        if (mm && node >= 0 && node < NUMA_NODE_COUNT) {
+        if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT) {
             bool was_populated = (pud_val(old_val) != 0);
             bool is_populated = (node_val != 0);
             
@@ -981,9 +986,9 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
         child_has_replicas = (READ_ONCE(child_base_page->pt_replica) != NULL);
     }
 
-    /* Try to get mm_struct from current task for entry tracking */
-    if (current && current->mm && current->mm != &init_mm)
-        mm = current->mm;
+    /* Get mm_struct from page owner for entry tracking */
+    if (mitosis_tracking_initialized)
+        mm = READ_ONCE(parent_page->pt_owner_mm);
 
     offset = ((unsigned long)p4dp) & ~PAGE_MASK;
     start_page = parent_page;
@@ -1010,7 +1015,7 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
         WRITE_ONCE(*replica_entry, __p4d(node_val));
         
         /* Track entry population changes if we have mm context */
-        if (mm && node >= 0 && node < NUMA_NODE_COUNT) {
+        if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT) {
             bool was_populated = (p4d_val(old_val) != 0);
             bool is_populated = (node_val != 0);
             
@@ -1079,9 +1084,9 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
         child_has_replicas = (READ_ONCE(child_base_page->pt_replica) != NULL);
     }
 
-    /* Try to get mm_struct from current task for entry tracking */
-    if (current && current->mm && current->mm != &init_mm)
-        mm = current->mm;
+    /* Get mm_struct from page owner for entry tracking */
+    if (mitosis_tracking_initialized)
+        mm = READ_ONCE(parent_page->pt_owner_mm);
 
     offset = ((unsigned long)pgdp) & ~PAGE_MASK;
     start_page = parent_page;
@@ -1114,7 +1119,7 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
         }
         
         /* Track entry population changes if we have mm context */
-        if (mm && node >= 0 && node < NUMA_NODE_COUNT) {
+        if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT) {
             bool was_populated = (pgd_val(old_val) != 0);
             bool is_populated = (node_val != 0);
             
@@ -1297,7 +1302,9 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
     struct page *pages[NUMA_NODE_COUNT];
     int count = 0;
     void *src;
-    int i, ret;
+    int i, j, ret;
+    int num_entries;
+    int primary_nid;
 
     if (!page || !mm || !alloc_fn || !mm->repl_in_progress)
         return false;
@@ -1312,10 +1319,121 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
     BUG_ON(!link_page_replicas(pages, count));
 
     src = page_address(page);
-    for (i = 1; i < count; i++) {
-        void *dst = page_address(pages[i]);
-        memcpy(dst, src, PAGE_SIZE);
-        clflush_cache_range(dst, PAGE_SIZE);
+    primary_nid = page_to_nid(pages[0]);
+    
+    /* Replicate entries and track for ALL pages (including primary at index 0) */
+    if (strcmp(level_name, "pte") == 0) {
+        pte_t *src_pte = (pte_t *)src;
+        pte_t *dst_pte;
+        pte_t val;
+        int nid;
+        
+        num_entries = PTRS_PER_PTE;
+        
+        /* Track primary page entries first */
+        for (j = 0; j < num_entries; j++) {
+            if (pte_val(src_pte[j]) != 0)
+                track_pte_entry(mm, primary_nid, true);
+        }
+        
+        /* Now copy and track replicas */
+        for (i = 1; i < count; i++) {
+            dst_pte = (pte_t *)page_address(pages[i]);
+            nid = page_to_nid(pages[i]);
+            
+            for (j = 0; j < num_entries; j++) {
+                val = READ_ONCE(src_pte[j]);
+                WRITE_ONCE(dst_pte[j], val);
+                
+                if (pte_val(val) != 0)
+                    track_pte_entry(mm, nid, true);
+            }
+            clflush_cache_range(dst_pte, PAGE_SIZE);
+        }
+    } else if (strcmp(level_name, "pmd") == 0) {
+        pmd_t *src_pmd = (pmd_t *)src;
+        pmd_t *dst_pmd;
+        pmd_t val;
+        int nid;
+        
+        num_entries = PTRS_PER_PMD;
+        
+        /* Track primary page entries first */
+        for (j = 0; j < num_entries; j++) {
+            if (pmd_val(src_pmd[j]) != 0)
+                track_pmd_entry(mm, primary_nid, true);
+        }
+        
+        /* Now copy and track replicas */
+        for (i = 1; i < count; i++) {
+            dst_pmd = (pmd_t *)page_address(pages[i]);
+            nid = page_to_nid(pages[i]);
+            
+            for (j = 0; j < num_entries; j++) {
+                val = READ_ONCE(src_pmd[j]);
+                WRITE_ONCE(dst_pmd[j], val);
+                
+                if (pmd_val(val) != 0)
+                    track_pmd_entry(mm, nid, true);
+            }
+            clflush_cache_range(dst_pmd, PAGE_SIZE);
+        }
+    } else if (strcmp(level_name, "pud") == 0) {
+        pud_t *src_pud = (pud_t *)src;
+        pud_t *dst_pud;
+        pud_t val;
+        int nid;
+        
+        num_entries = PTRS_PER_PUD;
+        
+        /* Track primary page entries first */
+        for (j = 0; j < num_entries; j++) {
+            if (pud_val(src_pud[j]) != 0)
+                track_pud_entry(mm, primary_nid, true);
+        }
+        
+        /* Now copy and track replicas */
+        for (i = 1; i < count; i++) {
+            dst_pud = (pud_t *)page_address(pages[i]);
+            nid = page_to_nid(pages[i]);
+            
+            for (j = 0; j < num_entries; j++) {
+                val = READ_ONCE(src_pud[j]);
+                WRITE_ONCE(dst_pud[j], val);
+                
+                if (pud_val(val) != 0)
+                    track_pud_entry(mm, nid, true);
+            }
+            clflush_cache_range(dst_pud, PAGE_SIZE);
+        }
+    } else if (strcmp(level_name, "p4d") == 0) {
+        p4d_t *src_p4d = (p4d_t *)src;
+        p4d_t *dst_p4d;
+        p4d_t val;
+        int nid;
+        
+        num_entries = PTRS_PER_P4D;
+        
+        /* Track primary page entries first */
+        for (j = 0; j < num_entries; j++) {
+            if (p4d_val(src_p4d[j]) != 0)
+                track_p4d_entry(mm, primary_nid, true);
+        }
+        
+        /* Now copy and track replicas */
+        for (i = 1; i < count; i++) {
+            dst_p4d = (p4d_t *)page_address(pages[i]);
+            nid = page_to_nid(pages[i]);
+            
+            for (j = 0; j < num_entries; j++) {
+                val = READ_ONCE(src_p4d[j]);
+                WRITE_ONCE(dst_p4d[j], val);
+                
+                if (p4d_val(val) != 0)
+                    track_p4d_entry(mm, nid, true);
+            }
+            clflush_cache_range(dst_p4d, PAGE_SIZE);
+        }
     }
 
     /* Track replica counts */
@@ -1643,21 +1761,47 @@ int pgtable_repl_enable(struct mm_struct *mm, nodemask_t nodes)
     if (ret)
         goto fail_cleanup;
 
-    /* Copy content to replicas */
-    for (i = 1; i < count; i++) {
-        void *dst = page_address(pgd_pages[i]);
-        memcpy(dst, base_pgd, PAGE_SIZE);
-        clflush_cache_range(dst, PAGE_SIZE);
+/* Track primary PGD entries first (user space only) */
+	{
+		int primary_nid = page_to_nid(base_page);
+		pgd_t *src_pgd = base_pgd;
+		int j;
+		
+		for (j = 0; j < KERNEL_PGD_BOUNDARY; j++) {
+			if (pgd_val(src_pgd[j]) != 0)
+				track_pgd_entry(mm, primary_nid, true);
+		}
+	}
 
-        if (mitosis_pti_active()) {
-            void *src_user = (void *)mitosis_kernel_to_user_pgd(base_pgd);
-            void *dst_user = (void *)mitosis_kernel_to_user_pgd(dst);
-            if (src_user && dst_user) {
-                memcpy(dst_user, src_user, PAGE_SIZE);
-                clflush_cache_range(dst_user, PAGE_SIZE);
-            }
-        }
-    }
+	/* Copy ALL entries to replicas, but only track user entries */
+	for (i = 1; i < count; i++) {
+		pgd_t *dst_pgd = page_address(pgd_pages[i]);
+		int nid = page_to_nid(pgd_pages[i]);
+		int j;
+		
+		/* Copy ALL kernel PGD entries (both user and kernel) */
+		for (j = 0; j < PTRS_PER_PGD; j++) {
+			pgd_t val = READ_ONCE(base_pgd[j]);
+			WRITE_ONCE(dst_pgd[j], val);
+			
+			/* Only track user-space entries */
+			if (j < KERNEL_PGD_BOUNDARY && pgd_val(val) != 0)
+				track_pgd_entry(mm, nid, true);
+		}
+		clflush_cache_range(dst_pgd, PAGE_SIZE);
+
+		if (mitosis_pti_active()) {
+			pgd_t *src_user = mitosis_kernel_to_user_pgd(base_pgd);
+			pgd_t *dst_user = mitosis_kernel_to_user_pgd(dst_pgd);
+			if (src_user && dst_user) {
+				/* Copy all user PGD entries (PTI user mapping) */
+				for (j = 0; j < PTRS_PER_PGD; j++) {
+					WRITE_ONCE(dst_user[j], READ_ONCE(src_user[j]));
+				}
+				clflush_cache_range(dst_user, PAGE_SIZE);
+			}
+		}
+	}
 
     BUG_ON(!link_page_replicas(pgd_pages, count));
 
@@ -2403,6 +2547,7 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep)
     unsigned long offset;
     pteval_t val = 0;
     unsigned long ptep_addr;
+    struct mm_struct *owner_mm = NULL;
 
     if (!ptep)
         return __pte(0);
@@ -2421,6 +2566,10 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep)
 
     atomic_inc(&repl_ptep_get_and_clear);
 
+    /* Get mm_struct from page owner for entry tracking */
+    if (mitosis_tracking_initialized)
+        owner_mm = READ_ONCE(pte_page->pt_owner_mm);
+
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
     start_page = pte_page;
     cur_page = pte_page;
@@ -2433,9 +2582,9 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep)
         val |= pte_val(old_pte);
         
         /* Track entry being cleared if we have mm context */
-        if (mm && mm != &init_mm && pte_val(old_pte) != 0) {
+        if (owner_mm && owner_mm != &init_mm && pte_val(old_pte) != 0) {
             if (node >= 0 && node < NUMA_NODE_COUNT) {
-                track_pte_entry(mm, node, false);
+                track_pte_entry(owner_mm, node, false);
             }
         }
         

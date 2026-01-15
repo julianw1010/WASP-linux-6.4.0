@@ -168,6 +168,7 @@ static inline p4d_t *p4d_alloc_one(struct mm_struct *mm, unsigned long addr)
             (mm->cache_only_mode || smp_load_acquire(&mm->repl_pgd_enabled))) {
             page = mitosis_cache_pop(node, MITOSIS_CACHE_P4D);
             if (page) {
+                page->pt_owner_mm = mm;
                 mitosis_track_p4d_alloc(mm, page_to_nid(page));
                 return (p4d_t *)page_address(page);
             }
@@ -176,6 +177,7 @@ static inline p4d_t *p4d_alloc_one(struct mm_struct *mm, unsigned long addr)
         /* Cache miss or replication disabled - allocate normally */
         page = alloc_pages_node(node, gfp | __GFP_ZERO, 0);
         if (page) {
+            page->pt_owner_mm = mm;
             mitosis_track_p4d_alloc(mm, page_to_nid(page));
             return (p4d_t *)page_address(page);
         }
@@ -203,6 +205,7 @@ static inline void p4d_free(struct mm_struct *mm, p4d_t *p4d)
 #ifdef CONFIG_PGTABLE_REPLICATION
     mitosis_free_p4d_node(mm, page);
 
+    page->pt_owner_mm = NULL;
     /* Try to return to cache if page was originally from cache */
     if (from_cache) {
         ClearPageMitosisFromCache(page);

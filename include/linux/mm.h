@@ -2779,6 +2779,7 @@ static inline bool pgtable_pte_page_ctor(struct page *page)
 	inc_lruvec_page_state(page, NR_PAGETABLE);
 #ifdef CONFIG_PGTABLE_REPLICATION
 	page->pt_replica = NULL;
+	page->pt_owner_mm = NULL;  /* Will be set by caller if known */
 #endif
 
 	return true;
@@ -2878,6 +2879,7 @@ static inline bool pgtable_pmd_page_ctor(struct page *page)
 	inc_lruvec_page_state(page, NR_PAGETABLE);
 #ifdef CONFIG_PGTABLE_REPLICATION
 	page->pt_replica = NULL;
+	page->pt_owner_mm = NULL;  /* Will be set by caller if known */
 #endif
 	return true;
 }

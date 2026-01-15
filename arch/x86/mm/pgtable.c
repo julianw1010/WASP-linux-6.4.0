@@ -456,6 +456,7 @@ static inline pgd_t *_pgd_alloc(struct mm_struct *mm)
             (mm->cache_only_mode || smp_load_acquire(&mm->repl_pgd_enabled))) {
             page = mitosis_cache_pop(node, MITOSIS_CACHE_PGD);
             if (page) {
+                page->pt_owner_mm = mm;
                 mitosis_track_pgd_alloc(mm, page_to_nid(page));
                 return (pgd_t *)page_address(page);
             }
@@ -464,6 +465,7 @@ static inline pgd_t *_pgd_alloc(struct mm_struct *mm)
         /* Cache miss or replication disabled - allocate normally */
         page = alloc_pages_node(node, gfp, order);
         if (page) {
+            page->pt_owner_mm = mm;
             mitosis_track_pgd_alloc(mm, page_to_nid(page));
             return (pgd_t *)page_address(page);
         }
@@ -481,8 +483,11 @@ static inline pgd_t *_pgd_alloc(struct mm_struct *mm)
     {
         node = mitosis_alloc_pgd_node(mm, numa_node_id());
         pgd_t *pgd = kmem_cache_alloc_node(pgd_cache, GFP_PGTABLE_USER, node);
-        if (pgd)
+        if (pgd) {
+            page = virt_to_page(pgd);
+            page->pt_owner_mm = mm;
             mitosis_track_pgd_alloc(mm, numa_node_id());
+        }
         return pgd;
     }
 #else
@@ -505,6 +510,7 @@ static inline void _pgd_free(struct mm_struct *mm, pgd_t *pgd)
 #ifdef CONFIG_PGTABLE_REPLICATION
         mitosis_free_pgd_node(mm, page);
 
+        page->pt_owner_mm = NULL;
         /* Try to return to cache if page was originally from cache - only for order 0 */
         if (order == 0 && from_cache) {
             ClearPageMitosisFromCache(page);
@@ -517,6 +523,8 @@ static inline void _pgd_free(struct mm_struct *mm, pgd_t *pgd)
 #endif
         free_pages((unsigned long)pgd, order);
     } else {
+        page = virt_to_page(pgd);
+        page->pt_owner_mm = NULL;
         kmem_cache_free(pgd_cache, pgd);
     }
 }
@@ -537,6 +545,7 @@ static inline pgd_t *_pgd_alloc(struct mm_struct *mm)
         (mm->cache_only_mode || smp_load_acquire(&mm->repl_pgd_enabled))) {
         page = mitosis_cache_pop(node, MITOSIS_CACHE_PGD);
         if (page) {
+            page->pt_owner_mm = mm;
             mitosis_track_pgd_alloc(mm, page_to_nid(page));
             return (pgd_t *)page_address(page);
         }
@@ -545,6 +554,7 @@ static inline pgd_t *_pgd_alloc(struct mm_struct *mm)
     /* Cache miss or replication disabled - allocate normally */
     page = alloc_pages_node(node, gfp, order);
     if (page) {
+        page->pt_owner_mm = mm;
         mitosis_track_pgd_alloc(mm, page_to_nid(page));
         return (pgd_t *)page_address(page);
     }
@@ -564,6 +574,7 @@ static inline void _pgd_free(struct mm_struct *mm, pgd_t *pgd)
 #ifdef CONFIG_PGTABLE_REPLICATION
     mitosis_free_pgd_node(mm, page);
 
+    page->pt_owner_mm = NULL;
     /* Try to return to cache if page was originally from cache - only for order 0 */
     if (order == 0 && from_cache) {
         ClearPageMitosisFromCache(page);

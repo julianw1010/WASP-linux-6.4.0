@@ -239,6 +239,7 @@ struct page {
 
 #ifdef CONFIG_PGTABLE_REPLICATION
             struct page *pt_replica;  /* Circular linked list of replica pages */
+            struct mm_struct *pt_owner_mm; /* mm_struct that owns this page table page */
 #endif
 } _struct_page_alignment;
 
