@@ -698,6 +698,11 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     struct mm_struct *mm = NULL;
     pte_t old_val;
     int node;
+    
+    if (!mitosis_tracking_initialized) {
+    native_set_pte(ptep, pteval);
+    return;
+    }
 
     if (!ptep) {
         native_set_pte(ptep, pteval);
@@ -796,6 +801,11 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
     struct mm_struct *mm = NULL;
     pmd_t old_val;
     int node;
+    
+    if (!mitosis_tracking_initialized) {
+    native_set_pmd(pmdp, pmdval);
+    return;
+}
 
     if (!pmdp) {
         native_set_pmd(pmdp, pmdval);
@@ -915,6 +925,11 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
     struct mm_struct *mm = NULL;
     pud_t old_val;
     int node;
+    
+    if (!mitosis_tracking_initialized) {
+    native_set_pud(pudp, pudval);
+    return;
+    }
 
     if (!pudp) {
         native_set_pud(pudp, pudval);
@@ -1034,6 +1049,11 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
     struct mm_struct *mm = NULL;
     p4d_t old_val;
     int node;
+    
+    if (!mitosis_tracking_initialized) {
+    native_set_p4d(p4dp, p4dval);
+    return;
+}
 
     if (!p4dp) {
         native_set_p4d(p4dp, p4dval);
@@ -1153,6 +1173,11 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
     struct mm_struct *mm = NULL;
     pgd_t old_val;
     int node;
+    
+    if (!mitosis_tracking_initialized) {
+    native_set_pgd(pgdp, pgdval);
+    return;
+}
 
     if (!pgdp) {
         native_set_pgd(pgdp, pgdval);
@@ -1271,6 +1296,10 @@ pte_t pgtable_repl_get_pte(pte_t *ptep)
     unsigned long offset;
     pteval_t val;
     unsigned long ptep_addr;
+    
+    if (!mitosis_tracking_initialized) {
+    return __pte(pte_val(*ptep));
+}
 
     if (!ptep)
         return __pte(0);
@@ -1419,6 +1448,12 @@ void pgtable_repl_ptep_modify_prot_commit(struct vm_area_struct *vma,
     struct page *start_page;
     unsigned long offset;
     unsigned long ptep_addr;
+    
+    if (!mitosis_tracking_initialized) {
+    WRITE_ONCE(*ptep, pte);
+    smp_wmb();
+    return;
+}
 
     if (!ptep) {
         return;
@@ -2736,6 +2771,10 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep)
     struct mm_struct *owner_mm = NULL;
     pte_t old_pte;
     int node;
+    
+    if (!mitosis_tracking_initialized) {
+    return native_ptep_get_and_clear(ptep);
+}
 
     if (!ptep)
         return __pte(0);
@@ -2804,6 +2843,11 @@ void pgtable_repl_ptep_set_wrprotect(struct mm_struct *mm,
     struct page *start_page;
     unsigned long offset;
     unsigned long ptep_addr;
+    
+    if (!mitosis_tracking_initialized) {
+    clear_bit(_PAGE_BIT_RW, (unsigned long *)&ptep->pte);
+    return;
+}
 
     if (!ptep) {
         clear_bit(_PAGE_BIT_RW, (unsigned long *)&ptep->pte);
@@ -2850,6 +2894,10 @@ int pgtable_repl_ptep_test_and_clear_young(struct vm_area_struct *vma,
     unsigned long offset;
     unsigned long ptep_addr;
     int young = 0;
+    
+    if (!mitosis_tracking_initialized) {
+    return test_and_clear_bit(_PAGE_BIT_ACCESSED, (unsigned long *)&ptep->pte);
+    }
 
     if (!ptep)
         return test_and_clear_bit(_PAGE_BIT_ACCESSED, (unsigned long *)&ptep->pte);
