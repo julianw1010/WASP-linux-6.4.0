@@ -322,6 +322,8 @@ static inline void track_entry_count_change(struct mm_struct *mm, int node,
  */
 static inline void track_pte_entry(struct mm_struct *mm, int node, bool is_increment)
 {
+	if (!mitosis_tracking_initialized)
+		return;
 	if (!mm || mm == &init_mm)
 		return;
 	track_entry_count_change(mm, node, &mm->pgtable_entries_pte[node],
@@ -333,6 +335,8 @@ static inline void track_pte_entry(struct mm_struct *mm, int node, bool is_incre
  */
 static inline void track_pmd_entry(struct mm_struct *mm, int node, bool is_increment)
 {
+	if (!mitosis_tracking_initialized)
+		return;
 	if (!mm || mm == &init_mm)
 		return;
 	track_entry_count_change(mm, node, &mm->pgtable_entries_pmd[node],
@@ -344,6 +348,8 @@ static inline void track_pmd_entry(struct mm_struct *mm, int node, bool is_incre
  */
 static inline void track_pud_entry(struct mm_struct *mm, int node, bool is_increment)
 {
+	if (!mitosis_tracking_initialized)
+		return;
 	if (!mm || mm == &init_mm)
 		return;
 	track_entry_count_change(mm, node, &mm->pgtable_entries_pud[node],
@@ -355,6 +361,8 @@ static inline void track_pud_entry(struct mm_struct *mm, int node, bool is_incre
  */
 static inline void track_p4d_entry(struct mm_struct *mm, int node, bool is_increment)
 {
+	if (!mitosis_tracking_initialized)
+		return;
 	if (!mm || mm == &init_mm)
 		return;
 	track_entry_count_change(mm, node, &mm->pgtable_entries_p4d[node],
@@ -366,6 +374,8 @@ static inline void track_p4d_entry(struct mm_struct *mm, int node, bool is_incre
  */
 static inline void track_pgd_entry(struct mm_struct *mm, int node, bool is_increment)
 {
+	if (!mitosis_tracking_initialized)
+		return;
 	if (!mm || mm == &init_mm)
 		return;
 	track_entry_count_change(mm, node, &mm->pgtable_entries_pgd[node],
