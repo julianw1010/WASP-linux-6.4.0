@@ -147,6 +147,8 @@
 # define GET_TAGGED_ADDR_CTRL()		(-EINVAL)
 #endif
 
+extern int mitosis_tracking_initialized;
+
 /*
  * this is where the system-wide overflow UID and GID are defined, for
  * architectures that now have 32-bit UID/GID but didn't in the past
@@ -2899,6 +2901,9 @@ case PR_SET_PGTABLE_REPL:
                 }
 
                 WRITE_ONCE(mm->cache_only_mode, enable);
+                
+                if (enable && !mitosis_tracking_initialized)
+                      mitosis_tracking_initialized = true;
 
                 /* Capture process metadata when enabling cache-only mode */
                 if (enable && mm->mitosis_repl_start_time == 0) {

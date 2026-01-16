@@ -53,6 +53,9 @@ atomic_t repl_release_pte_freed = ATOMIC_INIT(0);
 struct mitosis_cache_head mitosis_cache[NUMA_NODE_COUNT];
 EXPORT_SYMBOL(mitosis_cache);
 
+bool mitosis_tracking_initialized = false;
+EXPORT_SYMBOL(mitosis_tracking_initialized);
+
 /*
  * mitosis_cache_init - Initialize the page table cache system
  *
@@ -246,8 +249,13 @@ static bool link_page_replicas(struct page **pages, int count);
  */
 static inline void track_replica_alloc(atomic64_t *current_count, atomic64_t *max_count)
 {
-	s64 cur = atomic64_inc_return(current_count);
-	s64 max = atomic64_read(max_count);
+	s64 cur, max;
+	
+	if (!mitosis_tracking_initialized)
+		return;
+	
+	cur = atomic64_inc_return(current_count);
+	max = atomic64_read(max_count);
 	while (cur > max) {
 		if (atomic64_cmpxchg(max_count, max, cur) == max)
 			break;
@@ -261,8 +269,13 @@ static inline void track_replica_alloc(atomic64_t *current_count, atomic64_t *ma
  */
 static inline void track_pgtable_alloc(atomic_t *current_count, atomic_t *max_count)
 {
-	int cur = atomic_inc_return(current_count);
-	int max = atomic_read(max_count);
+	int cur, max;
+	
+	if (!mitosis_tracking_initialized)
+		return;
+	
+	cur = atomic_inc_return(current_count);
+	max = atomic_read(max_count);
 	while (cur > max) {
 		if (atomic_cmpxchg(max_count, max, cur) == max)
 			break;
@@ -272,19 +285,21 @@ static inline void track_pgtable_alloc(atomic_t *current_count, atomic_t *max_co
 
 static inline void track_replica_free(atomic64_t *current_count)
 {
+	if (!mitosis_tracking_initialized)
+		return;
+	
 	atomic64_dec(current_count);
 }
 
-/*
- * Helper to track entry population changes and update max counts.
- * Called when an entry transitions between zero and non-zero.
- */
 static inline void track_entry_count_change(struct mm_struct *mm, int node,
                                             atomic64_t *current_count,
                                             atomic64_t *max_count,
                                             bool is_increment)
 {
 	s64 cur, max;
+	
+	if (!mitosis_tracking_initialized)
+		return;
 	
 	if (!mm || mm == &init_mm || node < 0 || node >= NUMA_NODE_COUNT)
 		return;
@@ -1953,6 +1968,10 @@ int pgtable_repl_enable(struct mm_struct *mm, nodemask_t nodes)
 
     mutex_unlock(&mm->repl_mutex);
     mutex_unlock(&global_repl_mutex);
+    
+    /* Mark tracking as initialized on first successful enable */
+    if (!mitosis_tracking_initialized)
+        mitosis_tracking_initialized = true;
 
     pr_info("MITOSIS: Enabled page table replication for mm %px on %d nodes\n", mm, count);
     return 0;
@@ -2927,6 +2946,8 @@ int mitosis_alloc_pgd_node(struct mm_struct *mm, int requested_node)
 
 void mitosis_track_pte_alloc(struct mm_struct *mm, int node)
 {
+	if (!mitosis_tracking_initialized)
+		return;
 	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT)
 		track_pgtable_alloc(&mm->pgtable_alloc_pte[node],
 				    &mm->pgtable_max_pte[node]);
@@ -2934,6 +2955,8 @@ void mitosis_track_pte_alloc(struct mm_struct *mm, int node)
 
 void mitosis_track_pmd_alloc(struct mm_struct *mm, int node)
 {
+	if (!mitosis_tracking_initialized)
+		return;
 	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT)
 		track_pgtable_alloc(&mm->pgtable_alloc_pmd[node],
 				    &mm->pgtable_max_pmd[node]);
@@ -2941,6 +2964,8 @@ void mitosis_track_pmd_alloc(struct mm_struct *mm, int node)
 
 void mitosis_track_pud_alloc(struct mm_struct *mm, int node)
 {
+	if (!mitosis_tracking_initialized)
+		return;
 	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT)
 		track_pgtable_alloc(&mm->pgtable_alloc_pud[node],
 				    &mm->pgtable_max_pud[node]);
@@ -2948,6 +2973,8 @@ void mitosis_track_pud_alloc(struct mm_struct *mm, int node)
 
 void mitosis_track_p4d_alloc(struct mm_struct *mm, int node)
 {
+	if (!mitosis_tracking_initialized)
+		return;
 	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT)
 		track_pgtable_alloc(&mm->pgtable_alloc_p4d[node],
 				    &mm->pgtable_max_p4d[node]);
@@ -2955,6 +2982,8 @@ void mitosis_track_p4d_alloc(struct mm_struct *mm, int node)
 
 void mitosis_track_pgd_alloc(struct mm_struct *mm, int node)
 {
+	if (!mitosis_tracking_initialized)
+		return;
 	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT)
 		track_pgtable_alloc(&mm->pgtable_alloc_pgd[node],
 				    &mm->pgtable_max_pgd[node]);
@@ -2963,6 +2992,8 @@ void mitosis_track_pgd_alloc(struct mm_struct *mm, int node)
 void mitosis_free_pte_node(struct mm_struct *mm, struct page *page)
 {
 	int node;
+	if (!mitosis_tracking_initialized)
+		return;
 	if (!mm || mm == &init_mm || !page)
 		return;
 	node = page_to_nid(page);
@@ -2973,6 +3004,8 @@ void mitosis_free_pte_node(struct mm_struct *mm, struct page *page)
 void mitosis_free_pmd_node(struct mm_struct *mm, struct page *page)
 {
 	int node;
+	if (!mitosis_tracking_initialized)
+		return;
 	if (!mm || mm == &init_mm || !page)
 		return;
 	node = page_to_nid(page);
@@ -2983,6 +3016,8 @@ void mitosis_free_pmd_node(struct mm_struct *mm, struct page *page)
 void mitosis_free_pud_node(struct mm_struct *mm, struct page *page)
 {
 	int node;
+	if (!mitosis_tracking_initialized)
+		return;
 	if (!mm || mm == &init_mm || !page)
 		return;
 	node = page_to_nid(page);
@@ -2993,6 +3028,8 @@ void mitosis_free_pud_node(struct mm_struct *mm, struct page *page)
 void mitosis_free_p4d_node(struct mm_struct *mm, struct page *page)
 {
 	int node;
+	if (!mitosis_tracking_initialized)
+		return;
 	if (!mm || mm == &init_mm || !page)
 		return;
 	node = page_to_nid(page);
@@ -3003,6 +3040,8 @@ void mitosis_free_p4d_node(struct mm_struct *mm, struct page *page)
 void mitosis_free_pgd_node(struct mm_struct *mm, struct page *page)
 {
 	int node;
+	if (!mitosis_tracking_initialized)
+		return;
 	if (!mm || mm == &init_mm || !page)
 		return;
 	node = page_to_nid(page);
