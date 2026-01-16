@@ -1049,7 +1049,7 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
     struct mm_struct *mm = NULL;
     p4d_t old_val;
     int node;
-    bool track_as_pgd = !pgtable_l5_enabled();  /* P4D folded into PGD */
+    bool track_as_pgd;
     
     if (!mitosis_tracking_initialized) {
         native_set_p4d(p4dp, p4dval);
@@ -1073,6 +1073,9 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
         native_set_p4d(p4dp, p4dval);
         return;
     }
+
+    /* Safe to call now - after early boot checks */
+    track_as_pgd = !pgtable_l5_enabled();
 
     /* Get mm_struct from page owner for entry tracking */
     mm = READ_ONCE(parent_page->pt_owner_mm);
