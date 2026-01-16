@@ -1309,6 +1309,43 @@ static int free_replica_chain_safe(struct page *primary_page, const char *level_
     for (i = 0; i < free_count; i++) {
         int nid = page_to_nid(pages_to_free[i]);
         bool from_cache = PageMitosisFromCache(pages_to_free[i]);
+        void *page_addr;
+        int j, num_entries;
+
+        /* NEW: Decrement entry counts for populated entries before freeing */
+        if (mm && mm != &init_mm) {
+            page_addr = page_address(pages_to_free[i]);
+            
+            if (strcmp(level_name, "pte") == 0) {
+                pte_t *pte = (pte_t *)page_addr;
+                num_entries = PTRS_PER_PTE;
+                for (j = 0; j < num_entries; j++) {
+                    if (pte_val(pte[j]) != 0)
+                        track_pte_entry(mm, nid, false);
+                }
+            } else if (strcmp(level_name, "pmd") == 0) {
+                pmd_t *pmd = (pmd_t *)page_addr;
+                num_entries = PTRS_PER_PMD;
+                for (j = 0; j < num_entries; j++) {
+                    if (pmd_val(pmd[j]) != 0)
+                        track_pmd_entry(mm, nid, false);
+                }
+            } else if (strcmp(level_name, "pud") == 0) {
+                pud_t *pud = (pud_t *)page_addr;
+                num_entries = PTRS_PER_PUD;
+                for (j = 0; j < num_entries; j++) {
+                    if (pud_val(pud[j]) != 0)
+                        track_pud_entry(mm, nid, false);
+                }
+            } else if (strcmp(level_name, "p4d") == 0) {
+                p4d_t *p4d = (p4d_t *)page_addr;
+                num_entries = PTRS_PER_P4D;
+                for (j = 0; j < num_entries; j++) {
+                    if (p4d_val(p4d[j]) != 0)
+                        track_p4d_entry(mm, nid, false);
+                }
+            }
+        }
 
         if (mm) {
             /* Decrement mm accounting based on level */
@@ -1432,12 +1469,6 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
         
         num_entries = PTRS_PER_PTE;
         
-        /* Track primary page entries first */
-        for (j = 0; j < num_entries; j++) {
-            if (pte_val(src_pte[j]) != 0)
-                track_pte_entry(mm, primary_nid, true);
-        }
-        
         /* Now copy and track replicas */
         for (i = 1; i < count; i++) {
             dst_pte = (pte_t *)page_address(pages[i]);
@@ -1459,12 +1490,6 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
         int nid;
         
         num_entries = PTRS_PER_PMD;
-        
-        /* Track primary page entries first */
-        for (j = 0; j < num_entries; j++) {
-            if (pmd_val(src_pmd[j]) != 0)
-                track_pmd_entry(mm, primary_nid, true);
-        }
         
         /* Now copy and track replicas */
         for (i = 1; i < count; i++) {
@@ -1488,12 +1513,6 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
         
         num_entries = PTRS_PER_PUD;
         
-        /* Track primary page entries first */
-        for (j = 0; j < num_entries; j++) {
-            if (pud_val(src_pud[j]) != 0)
-                track_pud_entry(mm, primary_nid, true);
-        }
-        
         /* Now copy and track replicas */
         for (i = 1; i < count; i++) {
             dst_pud = (pud_t *)page_address(pages[i]);
@@ -1515,12 +1534,6 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
         int nid;
         
         num_entries = PTRS_PER_P4D;
-        
-        /* Track primary page entries first */
-        for (j = 0; j < num_entries; j++) {
-            if (p4d_val(src_p4d[j]) != 0)
-                track_p4d_entry(mm, primary_nid, true);
-        }
         
         /* Now copy and track replicas */
         for (i = 1; i < count; i++) {
@@ -1863,18 +1876,6 @@ int pgtable_repl_enable(struct mm_struct *mm, nodemask_t nodes)
     if (ret)
         goto fail_cleanup;
 
-/* Track primary PGD entries first (user space only) */
-	{
-		int primary_nid = page_to_nid(base_page);
-		pgd_t *src_pgd = base_pgd;
-		int j;
-		
-		for (j = 0; j < KERNEL_PGD_BOUNDARY; j++) {
-			if (pgd_val(src_pgd[j]) != 0)
-				track_pgd_entry(mm, primary_nid, true);
-		}
-	}
-
 	/* Copy ALL entries to replicas, but only track user entries */
 	for (i = 1; i < count; i++) {
 		pgd_t *dst_pgd = page_address(pgd_pages[i]);
@@ -2088,6 +2089,7 @@ static void free_pgd_replicas(struct mm_struct *mm, int keep_node)
         pgd_t *replica_pgd;
         struct page *replica_page;
         bool from_cache;
+        int j;
 
         if (node == keep_node)
             continue;
@@ -2099,6 +2101,14 @@ static void free_pgd_replicas(struct mm_struct *mm, int keep_node)
         replica_page = virt_to_page(replica_pgd);
         from_cache = PageMitosisFromCache(replica_page);
         WRITE_ONCE(replica_page->pt_replica, NULL);
+
+        /* NEW: Decrement entry counts for populated user-space entries */
+        if (mm && mm != &init_mm) {
+            for (j = 0; j < KERNEL_PGD_BOUNDARY; j++) {
+                if (pgd_val(replica_pgd[j]) != 0)
+                    track_pgd_entry(mm, node, false);
+            }
+        }
 
         track_replica_free(&mm->mitosis_pgd_replicas[node]);
 
@@ -2409,6 +2419,17 @@ void pgtable_repl_release_pte(struct mm_struct *mm, unsigned long pfn)
     for (i = 0; i < free_count; i++) {
         int nid = page_to_nid(pages_to_free[i]);
         bool from_cache = PageMitosisFromCache(pages_to_free[i]);
+        pte_t *pte;
+        int j;
+
+        /* NEW: Decrement entry counts for populated entries */
+        if (mm && mm != &init_mm) {
+            pte = (pte_t *)page_address(pages_to_free[i]);
+            for (j = 0; j < PTRS_PER_PTE; j++) {
+                if (pte_val(pte[j]) != 0)
+                    track_pte_entry(mm, nid, false);
+            }
+        }
 
         if (mm) {
             mm_dec_nr_ptes(mm);
@@ -2461,6 +2482,17 @@ void pgtable_repl_release_pmd(struct mm_struct *mm, unsigned long pfn)
     for (i = 0; i < free_count; i++) {
         int nid = page_to_nid(pages_to_free[i]);
         bool from_cache = PageMitosisFromCache(pages_to_free[i]);
+        pmd_t *pmd;
+        int j;
+
+        /* NEW: Decrement entry counts for populated entries */
+        if (mm && mm != &init_mm) {
+            pmd = (pmd_t *)page_address(pages_to_free[i]);
+            for (j = 0; j < PTRS_PER_PMD; j++) {
+                if (pmd_val(pmd[j]) != 0)
+                    track_pmd_entry(mm, nid, false);
+            }
+        }
 
         if (mm) {
             mm_dec_nr_pmds(mm);
@@ -2511,6 +2543,17 @@ void pgtable_repl_release_pud(struct mm_struct *mm, unsigned long pfn)
     for (i = 0; i < free_count; i++) {
         int nid = page_to_nid(pages_to_free[i]);
         bool from_cache = PageMitosisFromCache(pages_to_free[i]);
+        pud_t *pud;
+        int j;
+
+        /* NEW: Decrement entry counts for populated entries */
+        if (mm && mm != &init_mm) {
+            pud = (pud_t *)page_address(pages_to_free[i]);
+            for (j = 0; j < PTRS_PER_PUD; j++) {
+                if (pud_val(pud[j]) != 0)
+                    track_pud_entry(mm, nid, false);
+            }
+        }
 
         if (mm) {
             mm_dec_nr_puds(mm);
@@ -2559,6 +2602,17 @@ void pgtable_repl_release_p4d(struct mm_struct *mm, unsigned long pfn)
     for (i = 0; i < free_count; i++) {
         int nid = page_to_nid(pages_to_free[i]);
         bool from_cache = PageMitosisFromCache(pages_to_free[i]);
+        p4d_t *p4d;
+        int j;
+
+        /* NEW: Decrement entry counts for populated entries */
+        if (mm && mm != &init_mm) {
+            p4d = (p4d_t *)page_address(pages_to_free[i]);
+            for (j = 0; j < PTRS_PER_P4D; j++) {
+                if (p4d_val(p4d[j]) != 0)
+                    track_p4d_entry(mm, nid, false);
+            }
+        }
 
         if (mm) {
             track_replica_free(&mm->mitosis_p4d_replicas[nid]);
