@@ -20,8 +20,6 @@
 
 #ifdef CONFIG_PGTABLE_REPLICATION
 
-static bool mitosis_tracking_initialized = false;
-
 atomic_t total_cr3_writes = ATOMIC_INIT(0);
 atomic_t replica_hits = ATOMIC_INIT(0);
 atomic_t primary_hits = ATOMIC_INIT(0);
@@ -75,7 +73,6 @@ void mitosis_cache_init(void)
 	pr_info("MITOSIS: Page table cache initialized\n");
 	
 	smp_wmb(); /* Ensure cache init completes before enabling tracking */
-	mitosis_tracking_initialized = true;
 }
 EXPORT_SYMBOL(mitosis_cache_init);
 
@@ -674,6 +671,8 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     unsigned long offset;
     unsigned long ptep_addr;
     struct mm_struct *mm = NULL;
+    pte_t old_val;
+    int node;
 
     if (!ptep) {
         native_set_pte(ptep, pteval);
@@ -693,8 +692,32 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
         return;
     }
 
+    /* Get mm_struct from page owner for entry tracking */
+
+        mm = READ_ONCE(pte_page->pt_owner_mm);
+
     if (!READ_ONCE(pte_page->pt_replica)) {
-        native_set_pte(ptep, pteval);
+        /* No replicas - check if this is cache-only mode */
+        if (mm && mm != &init_mm && mm->cache_only_mode) {
+            node = page_to_nid(pte_page);
+            old_val = READ_ONCE(*ptep);
+            
+            native_set_pte(ptep, pteval);
+            
+            /* Track entry population changes for cache-only mode */
+            if (node >= 0 && node < NUMA_NODE_COUNT) {
+                bool was_populated = (pte_val(old_val) != 0);
+                bool is_populated = (pte_val(pteval) != 0);
+                
+                if (!was_populated && is_populated) {
+                    track_pte_entry(mm, node, true);
+                } else if (was_populated && !is_populated) {
+                    track_pte_entry(mm, node, false);
+                }
+            }
+        } else {
+            native_set_pte(ptep, pteval);
+        }
         return;
     }
 
@@ -702,10 +725,6 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
         atomic_inc(&repl_pte_clears);
     else
         atomic_inc(&repl_pte_sets);
-
-    /* Get mm_struct from page owner for entry tracking */
-    if (mitosis_tracking_initialized)
-        mm = READ_ONCE(pte_page->pt_owner_mm);
 
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
     start_page = pte_page;
@@ -751,6 +770,8 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
     bool child_has_replicas = false;
     unsigned long pmdp_addr;
     struct mm_struct *mm = NULL;
+    pmd_t old_val;
+    int node;
 
     if (!pmdp) {
         native_set_pmd(pmdp, pmdval);
@@ -770,8 +791,32 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
         return;
     }
 
+    /* Get mm_struct from page owner for entry tracking */
+
+        mm = READ_ONCE(parent_page->pt_owner_mm);
+
     if (!READ_ONCE(parent_page->pt_replica)) {
-        native_set_pmd(pmdp, pmdval);
+        /* No replicas - check if this is cache-only mode */
+        if (mm && mm != &init_mm && mm->cache_only_mode) {
+            node = page_to_nid(parent_page);
+            old_val = READ_ONCE(*pmdp);
+            
+            native_set_pmd(pmdp, pmdval);
+            
+            /* Track entry population changes for cache-only mode */
+            if (node >= 0 && node < NUMA_NODE_COUNT) {
+                bool was_populated = (pmd_val(old_val) != 0);
+                bool is_populated = (pmd_val(pmdval) != 0);
+                
+                if (!was_populated && is_populated) {
+                    track_pmd_entry(mm, node, true);
+                } else if (was_populated && !is_populated) {
+                    track_pmd_entry(mm, node, false);
+                }
+            }
+        } else {
+            native_set_pmd(pmdp, pmdval);
+        }
         return;
     }
 
@@ -789,10 +834,6 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
         child_base_page = pfn_to_page(child_phys >> PAGE_SHIFT);
         child_has_replicas = (READ_ONCE(child_base_page->pt_replica) != NULL);
     }
-
-    /* Get mm_struct from page owner for entry tracking */
-    if (mitosis_tracking_initialized)
-        mm = READ_ONCE(parent_page->pt_owner_mm);
 
     offset = ((unsigned long)pmdp) & ~PAGE_MASK;
     start_page = parent_page;
@@ -849,6 +890,8 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
     bool child_has_replicas = false;
     unsigned long pudp_addr;
     struct mm_struct *mm = NULL;
+    pud_t old_val;
+    int node;
 
     if (!pudp) {
         native_set_pud(pudp, pudval);
@@ -868,8 +911,31 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
         return;
     }
 
+    /* Get mm_struct from page owner for entry tracking */
+        mm = READ_ONCE(parent_page->pt_owner_mm);
+
     if (!READ_ONCE(parent_page->pt_replica)) {
-        native_set_pud(pudp, pudval);
+        /* No replicas - check if this is cache-only mode */
+        if (mm && mm != &init_mm && mm->cache_only_mode) {
+            node = page_to_nid(parent_page);
+            old_val = READ_ONCE(*pudp);
+            
+            native_set_pud(pudp, pudval);
+            
+            /* Track entry population changes for cache-only mode */
+            if (node >= 0 && node < NUMA_NODE_COUNT) {
+                bool was_populated = (pud_val(old_val) != 0);
+                bool is_populated = (pud_val(pudval) != 0);
+                
+                if (!was_populated && is_populated) {
+                    track_pud_entry(mm, node, true);
+                } else if (was_populated && !is_populated) {
+                    track_pud_entry(mm, node, false);
+                }
+            }
+        } else {
+            native_set_pud(pudp, pudval);
+        }
         return;
     }
 
@@ -887,10 +953,6 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
         child_base_page = pfn_to_page(child_phys >> PAGE_SHIFT);
         child_has_replicas = (READ_ONCE(child_base_page->pt_replica) != NULL);
     }
-
-    /* Get mm_struct from page owner for entry tracking */
-    if (mitosis_tracking_initialized)
-        mm = READ_ONCE(parent_page->pt_owner_mm);
 
     offset = ((unsigned long)pudp) & ~PAGE_MASK;
     start_page = parent_page;
@@ -947,6 +1009,8 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
     bool child_has_replicas = false;
     unsigned long p4dp_addr;
     struct mm_struct *mm = NULL;
+    p4d_t old_val;
+    int node;
 
     if (!p4dp) {
         native_set_p4d(p4dp, p4dval);
@@ -966,8 +1030,32 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
         return;
     }
 
+    /* Get mm_struct from page owner for entry tracking */
+
+        mm = READ_ONCE(parent_page->pt_owner_mm);
+
     if (!READ_ONCE(parent_page->pt_replica)) {
-        native_set_p4d(p4dp, p4dval);
+        /* No replicas - check if this is cache-only mode */
+        if (mm && mm != &init_mm && mm->cache_only_mode) {
+            node = page_to_nid(parent_page);
+            old_val = READ_ONCE(*p4dp);
+            
+            native_set_p4d(p4dp, p4dval);
+            
+            /* Track entry population changes for cache-only mode */
+            if (node >= 0 && node < NUMA_NODE_COUNT) {
+                bool was_populated = (p4d_val(old_val) != 0);
+                bool is_populated = (p4d_val(p4dval) != 0);
+                
+                if (!was_populated && is_populated) {
+                    track_p4d_entry(mm, node, true);
+                } else if (was_populated && !is_populated) {
+                    track_p4d_entry(mm, node, false);
+                }
+            }
+        } else {
+            native_set_p4d(p4dp, p4dval);
+        }
         return;
     }
 
@@ -985,10 +1073,6 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
         child_base_page = pfn_to_page(child_phys >> PAGE_SHIFT);
         child_has_replicas = (READ_ONCE(child_base_page->pt_replica) != NULL);
     }
-
-    /* Get mm_struct from page owner for entry tracking */
-    if (mitosis_tracking_initialized)
-        mm = READ_ONCE(parent_page->pt_owner_mm);
 
     offset = ((unsigned long)p4dp) & ~PAGE_MASK;
     start_page = parent_page;
@@ -1045,6 +1129,8 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
     bool child_has_replicas = false;
     unsigned long pgdp_addr;
     struct mm_struct *mm = NULL;
+    pgd_t old_val;
+    int node;
 
     if (!pgdp) {
         native_set_pgd(pgdp, pgdval);
@@ -1064,8 +1150,32 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
         return;
     }
 
+    /* Get mm_struct from page owner for entry tracking */
+
+        mm = READ_ONCE(parent_page->pt_owner_mm);
+
     if (!READ_ONCE(parent_page->pt_replica)) {
-        native_set_pgd(pgdp, pgdval);
+        /* No replicas - check if this is cache-only mode */
+        if (mm && mm != &init_mm && mm->cache_only_mode) {
+            node = page_to_nid(parent_page);
+            old_val = READ_ONCE(*pgdp);
+            
+            native_set_pgd(pgdp, pgdval);
+            
+            /* Track entry population changes for cache-only mode */
+            if (node >= 0 && node < NUMA_NODE_COUNT) {
+                bool was_populated = (pgd_val(old_val) != 0);
+                bool is_populated = (pgd_val(pgdval) != 0);
+                
+                if (!was_populated && is_populated) {
+                    track_pgd_entry(mm, node, true);
+                } else if (was_populated && !is_populated) {
+                    track_pgd_entry(mm, node, false);
+                }
+            }
+        } else {
+            native_set_pgd(pgdp, pgdval);
+        }
         return;
     }
 
@@ -1083,10 +1193,6 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
         child_base_page = pfn_to_page(child_phys >> PAGE_SHIFT);
         child_has_replicas = (READ_ONCE(child_base_page->pt_replica) != NULL);
     }
-
-    /* Get mm_struct from page owner for entry tracking */
-    if (mitosis_tracking_initialized)
-        mm = READ_ONCE(parent_page->pt_owner_mm);
 
     offset = ((unsigned long)pgdp) & ~PAGE_MASK;
     start_page = parent_page;
@@ -2548,6 +2654,8 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep)
     pteval_t val = 0;
     unsigned long ptep_addr;
     struct mm_struct *owner_mm = NULL;
+    pte_t old_pte;
+    int node;
 
     if (!ptep)
         return __pte(0);
@@ -2561,14 +2669,28 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep)
     if (!pte_page || !pfn_valid(page_to_pfn(pte_page)))
         return native_ptep_get_and_clear(ptep);
 
-    if (!READ_ONCE(pte_page->pt_replica))
-        return native_ptep_get_and_clear(ptep);
+    /* Get mm_struct from page owner for entry tracking */
+
+        owner_mm = READ_ONCE(pte_page->pt_owner_mm);
+
+    if (!READ_ONCE(pte_page->pt_replica)) {
+        /* No replicas - check if this is cache-only mode */
+        if (owner_mm && owner_mm != &init_mm && owner_mm->cache_only_mode) {
+            node = page_to_nid(pte_page);
+            old_pte = native_ptep_get_and_clear(ptep);
+            
+            /* Track entry being cleared for cache-only mode */
+            if (node >= 0 && node < NUMA_NODE_COUNT && pte_val(old_pte) != 0) {
+                track_pte_entry(owner_mm, node, false);
+            }
+            
+            return old_pte;
+        } else {
+            return native_ptep_get_and_clear(ptep);
+        }
+    }
 
     atomic_inc(&repl_ptep_get_and_clear);
-
-    /* Get mm_struct from page owner for entry tracking */
-    if (mitosis_tracking_initialized)
-        owner_mm = READ_ONCE(pte_page->pt_owner_mm);
 
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
     start_page = pte_page;
@@ -2755,35 +2877,40 @@ int mitosis_alloc_pgd_node(struct mm_struct *mm, int requested_node)
 
 void mitosis_track_pte_alloc(struct mm_struct *mm, int node)
 {
-	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT)
+	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT &&
+	    (mm->repl_pgd_enabled || mm->cache_only_mode))
 		track_pgtable_alloc(&mm->pgtable_alloc_pte[node],
 				    &mm->pgtable_max_pte[node]);
 }
 
 void mitosis_track_pmd_alloc(struct mm_struct *mm, int node)
 {
-	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT)
+	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT &&
+	    (mm->repl_pgd_enabled || mm->cache_only_mode))
 		track_pgtable_alloc(&mm->pgtable_alloc_pmd[node],
 				    &mm->pgtable_max_pmd[node]);
 }
 
 void mitosis_track_pud_alloc(struct mm_struct *mm, int node)
 {
-	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT)
+	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT &&
+	    (mm->repl_pgd_enabled || mm->cache_only_mode))
 		track_pgtable_alloc(&mm->pgtable_alloc_pud[node],
 				    &mm->pgtable_max_pud[node]);
 }
 
 void mitosis_track_p4d_alloc(struct mm_struct *mm, int node)
 {
-	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT)
+	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT &&
+	    (mm->repl_pgd_enabled || mm->cache_only_mode))
 		track_pgtable_alloc(&mm->pgtable_alloc_p4d[node],
 				    &mm->pgtable_max_p4d[node]);
 }
 
 void mitosis_track_pgd_alloc(struct mm_struct *mm, int node)
 {
-	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT)
+	if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT &&
+	    (mm->repl_pgd_enabled || mm->cache_only_mode))
 		track_pgtable_alloc(&mm->pgtable_alloc_pgd[node],
 				    &mm->pgtable_max_pgd[node]);
 }
@@ -2792,6 +2919,8 @@ void mitosis_free_pte_node(struct mm_struct *mm, struct page *page)
 {
 	int node;
 	if (!mm || mm == &init_mm || !page)
+		return;
+	if (!mm->repl_pgd_enabled && !mm->cache_only_mode)
 		return;
 	node = page_to_nid(page);
 	if (node >= 0 && node < NUMA_NODE_COUNT)
@@ -2803,6 +2932,8 @@ void mitosis_free_pmd_node(struct mm_struct *mm, struct page *page)
 	int node;
 	if (!mm || mm == &init_mm || !page)
 		return;
+	if (!mm->repl_pgd_enabled && !mm->cache_only_mode)
+		return;
 	node = page_to_nid(page);
 	if (node >= 0 && node < NUMA_NODE_COUNT)
 		atomic_dec(&mm->pgtable_alloc_pmd[node]);
@@ -2812,6 +2943,8 @@ void mitosis_free_pud_node(struct mm_struct *mm, struct page *page)
 {
 	int node;
 	if (!mm || mm == &init_mm || !page)
+		return;
+	if (!mm->repl_pgd_enabled && !mm->cache_only_mode)
 		return;
 	node = page_to_nid(page);
 	if (node >= 0 && node < NUMA_NODE_COUNT)
@@ -2823,6 +2956,8 @@ void mitosis_free_p4d_node(struct mm_struct *mm, struct page *page)
 	int node;
 	if (!mm || mm == &init_mm || !page)
 		return;
+	if (!mm->repl_pgd_enabled && !mm->cache_only_mode)
+		return;
 	node = page_to_nid(page);
 	if (node >= 0 && node < NUMA_NODE_COUNT)
 		atomic_dec(&mm->pgtable_alloc_p4d[node]);
@@ -2832,6 +2967,8 @@ void mitosis_free_pgd_node(struct mm_struct *mm, struct page *page)
 {
 	int node;
 	if (!mm || mm == &init_mm || !page)
+		return;
+	if (!mm->repl_pgd_enabled && !mm->cache_only_mode)
 		return;
 	node = page_to_nid(page);
 	if (node >= 0 && node < NUMA_NODE_COUNT)
