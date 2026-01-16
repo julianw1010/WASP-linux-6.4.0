@@ -1088,7 +1088,7 @@ static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
     pte_t pte;
 
 #ifdef CONFIG_PGTABLE_REPLICATION
-    if (mm && mm != &init_mm && smp_load_acquire(&mm->repl_pgd_enabled)) {
+    if (mm && mm != &init_mm) {
         pte = pgtable_repl_ptep_get_and_clear(mm, ptep);
         page_table_check_pte_clear(mm, addr, pte);
         return pte;

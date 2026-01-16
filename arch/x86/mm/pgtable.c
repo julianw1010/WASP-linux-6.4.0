@@ -650,12 +650,6 @@ out:
 
 void pgd_free(struct mm_struct *mm, pgd_t *pgd)
 {
-#ifdef CONFIG_PGTABLE_REPLICATION
-	{
-		struct page *page = virt_to_page(pgd);
-		mitosis_free_pgd_node(mm, page);
-	}
-#endif
 	pgd_mop_up_pmds(mm, pgd);
 	pgd_dtor(pgd);
 	paravirt_pgd_free(mm, pgd);

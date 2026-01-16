@@ -1460,7 +1460,8 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
     src = page_address(page);
     primary_nid = page_to_nid(pages[0]);
     
-    /* Replicate entries and track for ALL pages (including primary at index 0) */
+    /* Copy entries to replicas and track only the new replica entries.
+      * Primary (index 0) entries were already tracked when initially set. */
     if (strcmp(level_name, "pte") == 0) {
         pte_t *src_pte = (pte_t *)src;
         pte_t *dst_pte;
@@ -1876,35 +1877,35 @@ int pgtable_repl_enable(struct mm_struct *mm, nodemask_t nodes)
     if (ret)
         goto fail_cleanup;
 
-	/* Copy ALL entries to replicas, but only track user entries */
-	for (i = 1; i < count; i++) {
-		pgd_t *dst_pgd = page_address(pgd_pages[i]);
-		int nid = page_to_nid(pgd_pages[i]);
-		int j;
-		
-		/* Copy ALL kernel PGD entries (both user and kernel) */
-		for (j = 0; j < PTRS_PER_PGD; j++) {
-			pgd_t val = READ_ONCE(base_pgd[j]);
-			WRITE_ONCE(dst_pgd[j], val);
-			
-			/* Only track user-space entries */
-			if (j < KERNEL_PGD_BOUNDARY && pgd_val(val) != 0)
-				track_pgd_entry(mm, nid, true);
-		}
-		clflush_cache_range(dst_pgd, PAGE_SIZE);
+    /* Copy ALL entries to replicas, but only track user entries */
+    for (i = 1; i < count; i++) {
+      pgd_t *dst_pgd = page_address(pgd_pages[i]);
+      int nid = page_to_nid(pgd_pages[i]);
+      int j;
+      
+      /* Copy ALL kernel PGD entries (both user and kernel) */
+      for (j = 0; j < PTRS_PER_PGD; j++) {
+        pgd_t val = READ_ONCE(base_pgd[j]);
+        WRITE_ONCE(dst_pgd[j], val);
+        
+        /* Only track user-space entries */
+        if (j < KERNEL_PGD_BOUNDARY && pgd_val(val) != 0)
+          track_pgd_entry(mm, nid, true);
+      }
+      clflush_cache_range(dst_pgd, PAGE_SIZE);
 
-		if (mitosis_pti_active()) {
-			pgd_t *src_user = mitosis_kernel_to_user_pgd(base_pgd);
-			pgd_t *dst_user = mitosis_kernel_to_user_pgd(dst_pgd);
-			if (src_user && dst_user) {
-				/* Copy all user PGD entries (PTI user mapping) */
-				for (j = 0; j < PTRS_PER_PGD; j++) {
-					WRITE_ONCE(dst_user[j], READ_ONCE(src_user[j]));
-				}
-				clflush_cache_range(dst_user, PAGE_SIZE);
-			}
-		}
-	}
+      if (mitosis_pti_active()) {
+        pgd_t *src_user = mitosis_kernel_to_user_pgd(base_pgd);
+        pgd_t *dst_user = mitosis_kernel_to_user_pgd(dst_pgd);
+        if (src_user && dst_user) {
+          /* Copy all user PGD entries (PTI user mapping) */
+          for (j = 0; j < PTRS_PER_PGD; j++) {
+            WRITE_ONCE(dst_user[j], READ_ONCE(src_user[j]));
+          }
+          clflush_cache_range(dst_user, PAGE_SIZE);
+        }
+      }
+    }
 
     BUG_ON(!link_page_replicas(pgd_pages, count));
 
