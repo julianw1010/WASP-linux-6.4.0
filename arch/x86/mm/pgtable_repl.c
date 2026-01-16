@@ -1049,11 +1049,12 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
     struct mm_struct *mm = NULL;
     p4d_t old_val;
     int node;
+    bool track_as_pgd = !pgtable_l5_enabled();  /* P4D folded into PGD */
     
     if (!mitosis_tracking_initialized) {
-    native_set_p4d(p4dp, p4dval);
-    return;
-}
+        native_set_p4d(p4dp, p4dval);
+        return;
+    }
 
     if (!p4dp) {
         native_set_p4d(p4dp, p4dval);
@@ -1090,9 +1091,15 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
                 bool is_populated = (p4d_val(p4dval) != 0);
                 
                 if (!was_populated && is_populated) {
-                    track_p4d_entry(mm, node, true);
+                    if (track_as_pgd)
+                        track_pgd_entry(mm, node, true);
+                    else
+                        track_p4d_entry(mm, node, true);
                 } else if (was_populated && !is_populated) {
-                    track_p4d_entry(mm, node, false);
+                    if (track_as_pgd)
+                        track_pgd_entry(mm, node, false);
+                    else
+                        track_p4d_entry(mm, node, false);
                 }
             }
         } else {
@@ -1146,9 +1153,15 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
             bool is_populated = (node_val != 0);
             
             if (!was_populated && is_populated) {
-                track_p4d_entry(mm, node, true);
+                if (track_as_pgd)
+                    track_pgd_entry(mm, node, true);
+                else
+                    track_p4d_entry(mm, node, true);
             } else if (was_populated && !is_populated) {
-                track_p4d_entry(mm, node, false);
+                if (track_as_pgd)
+                    track_pgd_entry(mm, node, false);
+                else
+                    track_p4d_entry(mm, node, false);
             }
         }
         
@@ -1341,6 +1354,7 @@ static int free_replica_chain_safe(struct page *primary_page, const char *level_
     int free_count = 0;
     int i;
     int dummy_level = 0;
+    bool p4d_track_as_pgd = !pgtable_l5_enabled();  /* P4D folded into PGD */
 
     if (!primary_page)
         return 0;
@@ -1366,7 +1380,7 @@ static int free_replica_chain_safe(struct page *primary_page, const char *level_
         void *page_addr;
         int j, num_entries;
 
-        /* NEW: Decrement entry counts for populated entries before freeing */
+        /* Decrement entry counts for populated entries before freeing */
         if (mm && mm != &init_mm) {
             page_addr = page_address(pages_to_free[i]);
             
@@ -1395,8 +1409,12 @@ static int free_replica_chain_safe(struct page *primary_page, const char *level_
                 p4d_t *p4d = (p4d_t *)page_addr;
                 num_entries = PTRS_PER_P4D;
                 for (j = 0; j < num_entries; j++) {
-                    if (p4d_val(p4d[j]) != 0)
-                        track_p4d_entry(mm, nid, false);
+                    if (p4d_val(p4d[j]) != 0) {
+                        if (p4d_track_as_pgd)
+                            track_pgd_entry(mm, nid, false);
+                        else
+                            track_p4d_entry(mm, nid, false);
+                    }
                 }
             }
         }
@@ -1504,6 +1522,7 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
     int i, j, ret;
     int num_entries;
     int primary_nid;
+    bool p4d_track_as_pgd = !pgtable_l5_enabled();  /* P4D folded into PGD */
 
     if (!page || !mm || !alloc_fn || !mm->repl_in_progress)
         return false;
@@ -1521,7 +1540,7 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
     primary_nid = page_to_nid(pages[0]);
     
     /* Copy entries to replicas and track only the new replica entries.
-      * Primary (index 0) entries were already tracked when initially set. */
+     * Primary (index 0) entries were already tracked when initially set. */
     if (strcmp(level_name, "pte") == 0) {
         pte_t *src_pte = (pte_t *)src;
         pte_t *dst_pte;
@@ -1530,7 +1549,6 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
         
         num_entries = PTRS_PER_PTE;
         
-        /* Now copy and track replicas */
         for (i = 1; i < count; i++) {
             dst_pte = (pte_t *)page_address(pages[i]);
             nid = page_to_nid(pages[i]);
@@ -1552,7 +1570,6 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
         
         num_entries = PTRS_PER_PMD;
         
-        /* Now copy and track replicas */
         for (i = 1; i < count; i++) {
             dst_pmd = (pmd_t *)page_address(pages[i]);
             nid = page_to_nid(pages[i]);
@@ -1574,7 +1591,6 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
         
         num_entries = PTRS_PER_PUD;
         
-        /* Now copy and track replicas */
         for (i = 1; i < count; i++) {
             dst_pud = (pud_t *)page_address(pages[i]);
             nid = page_to_nid(pages[i]);
@@ -1596,7 +1612,6 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
         
         num_entries = PTRS_PER_P4D;
         
-        /* Now copy and track replicas */
         for (i = 1; i < count; i++) {
             dst_p4d = (p4d_t *)page_address(pages[i]);
             nid = page_to_nid(pages[i]);
@@ -1605,8 +1620,12 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
                 val = READ_ONCE(src_p4d[j]);
                 WRITE_ONCE(dst_p4d[j], val);
                 
-                if (p4d_val(val) != 0)
-                    track_p4d_entry(mm, nid, true);
+                if (p4d_val(val) != 0) {
+                    if (p4d_track_as_pgd)
+                        track_pgd_entry(mm, nid, true);
+                    else
+                        track_p4d_entry(mm, nid, true);
+                }
             }
             clflush_cache_range(dst_p4d, PAGE_SIZE);
         }
