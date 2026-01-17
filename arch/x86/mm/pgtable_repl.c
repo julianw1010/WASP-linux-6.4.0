@@ -712,7 +712,6 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     struct mm_struct *mm = NULL;
     pte_t old_val;
     int node;
-    int idx;
     
     if (!mitosis_tracking_initialized) {
         native_set_pte(ptep, pteval);
@@ -739,7 +738,6 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
 
     mm = READ_ONCE(pte_page->pt_owner_mm);
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
-    idx = offset / sizeof(pte_t);
 
     if (!READ_ONCE(pte_page->pt_replica)) {
         if (!mm || mm == &init_mm) {
@@ -750,7 +748,6 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
         node = page_to_nid(pte_page);
         old_val = READ_ONCE(*ptep);
         
-        atomic64_inc(&mm->debug_native_set_pte_calls);
         native_set_pte(ptep, pteval);
         
         if (node >= 0 && node < NUMA_NODE_COUNT) {
@@ -781,15 +778,11 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
         
         WRITE_ONCE(*replica_entry, pteval);
         
-        if (pte_val(pteval) != 0)
-            atomic64_inc(&debug_repl_should_track);
-        
         if (mm && mm != &init_mm && cur_node >= 0 && cur_node < NUMA_NODE_COUNT) {
             bool was_populated = (pte_val(old_entry) != 0);
             bool is_populated = (pte_val(pteval) != 0);
             
             if (!was_populated && is_populated) {
-                atomic64_inc(&debug_repl_did_track);
                 track_pte_entry(mm, cur_node, true);
             } else if (was_populated && !is_populated) {
                 track_pte_entry(mm, cur_node, false);
@@ -1474,61 +1467,6 @@ static int free_replica_chain_safe(struct page *primary_page, const char *level_
     }
 
     return free_count;
-}
-
-void pgtable_repl_ptep_modify_prot_commit(struct vm_area_struct *vma,
-                                           unsigned long addr, pte_t *ptep,
-                                           pte_t pte)
-{
-    struct page *pte_page;
-    struct page *cur_page;
-    struct page *start_page;
-    unsigned long offset;
-    unsigned long ptep_addr;
-    
-    if (!mitosis_tracking_initialized) {
-    WRITE_ONCE(*ptep, pte);
-    smp_wmb();
-    return;
-}
-
-    if (!ptep) {
-        return;
-    }
-
-    ptep_addr = (unsigned long)ptep;
-    if (ptep_addr < PAGE_OFFSET) {
-        WRITE_ONCE(*ptep, pte);
-        smp_wmb();
-        return;
-    }
-
-    pte_page = virt_to_page(ptep);
-
-    if (!pte_page || !pfn_valid(page_to_pfn(pte_page))) {
-        WRITE_ONCE(*ptep, pte);
-        smp_wmb();
-        return;
-    }
-
-    if (!READ_ONCE(pte_page->pt_replica)) {
-        WRITE_ONCE(*ptep, pte);
-        smp_wmb();
-        return;
-    }
-
-    atomic_inc(&repl_prot_commits);
-    offset = ((unsigned long)ptep) & ~PAGE_MASK;
-    start_page = pte_page;
-    cur_page = pte_page;
-
-    do {
-        pte_t *replica_entry = (pte_t *)(page_address(cur_page) + offset);
-        WRITE_ONCE(*replica_entry, pte);
-        cur_page = READ_ONCE(cur_page->pt_replica);
-    } while (cur_page && cur_page != start_page);
-
-    smp_wmb();
 }
 
 static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
@@ -2828,9 +2766,8 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep)
     pte_t old_pte;
     int node;
     
-    if (!mitosis_tracking_initialized) {
-    return native_ptep_get_and_clear(ptep);
-}
+    if (!mitosis_tracking_initialized)
+        return native_ptep_get_and_clear(ptep);
 
     if (!ptep)
         return __pte(0);
@@ -2844,43 +2781,35 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep)
     if (!pte_page || !pfn_valid(page_to_pfn(pte_page)))
         return native_ptep_get_and_clear(ptep);
 
-    /* Get mm_struct from page owner for entry tracking */
     owner_mm = READ_ONCE(pte_page->pt_owner_mm);
+    offset = ((unsigned long)ptep) & ~PAGE_MASK;
 
     if (!READ_ONCE(pte_page->pt_replica)) {
-        /* No replicas - track entries unconditionally */
-        if (owner_mm && owner_mm != &init_mm) {
-            node = page_to_nid(pte_page);
-            old_pte = native_ptep_get_and_clear(ptep);
-            
-            /* Track entry being cleared */
-            if (node >= 0 && node < NUMA_NODE_COUNT && pte_val(old_pte) != 0) {
-                track_pte_entry(owner_mm, node, false);
-            }
-            
-            return old_pte;
-        } else {
-            return native_ptep_get_and_clear(ptep);
+        node = page_to_nid(pte_page);
+        old_pte = native_ptep_get_and_clear(ptep);
+        
+        if (owner_mm && owner_mm != &init_mm && node >= 0 && 
+            node < NUMA_NODE_COUNT && pte_val(old_pte) != 0) {
+            track_pte_entry(owner_mm, node, false);
         }
+        return old_pte;
     }
 
     atomic_inc(&repl_ptep_get_and_clear);
 
-    offset = ((unsigned long)ptep) & ~PAGE_MASK;
     start_page = pte_page;
     cur_page = pte_page;
 
     do {
         pte_t *replica_entry = (pte_t *)(page_address(cur_page) + offset);
-        pte_t old_pte = native_ptep_get_and_clear(replica_entry);
-        int node = page_to_nid(cur_page);
+        pte_t old_entry = native_ptep_get_and_clear(replica_entry);
+        int cur_node = page_to_nid(cur_page);
         
-        val |= pte_val(old_pte);
+        val |= pte_val(old_entry);
         
-        /* Track entry being cleared if we have mm context */
-        if (owner_mm && owner_mm != &init_mm && pte_val(old_pte) != 0) {
-            if (node >= 0 && node < NUMA_NODE_COUNT) {
-                track_pte_entry(owner_mm, node, false);
+        if (owner_mm && owner_mm != &init_mm && pte_val(old_entry) != 0) {
+            if (cur_node >= 0 && cur_node < NUMA_NODE_COUNT) {
+                track_pte_entry(owner_mm, cur_node, false);
             }
         }
         
@@ -3172,7 +3101,6 @@ EXPORT_SYMBOL(pgtable_repl_set_pmd);
 EXPORT_SYMBOL(pgtable_repl_set_pud);
 EXPORT_SYMBOL(pgtable_repl_set_p4d);
 EXPORT_SYMBOL(pgtable_repl_set_pgd);
-EXPORT_SYMBOL(pgtable_repl_ptep_modify_prot_commit);
 EXPORT_SYMBOL(pgtable_repl_init_mm);
 EXPORT_SYMBOL(total_cr3_writes);
 EXPORT_SYMBOL(replica_hits);

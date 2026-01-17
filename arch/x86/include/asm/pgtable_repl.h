@@ -133,9 +133,6 @@ void pgtable_repl_set_pte(pte_t *pte, pte_t pteval);
 pte_t pgtable_repl_get_pte(pte_t *ptep);
 bool mitosis_should_auto_enable(void);
 
-void pgtable_repl_ptep_modify_prot_commit(struct vm_area_struct *vma, 
-                                          unsigned long addr,
-                                          pte_t *ptep, pte_t pte);
 void pgtable_repl_alloc_pte(struct mm_struct *mm, unsigned long pfn);
 void pgtable_repl_alloc_pmd(struct mm_struct *mm, unsigned long pfn);
 void pgtable_repl_alloc_pud(struct mm_struct *mm, unsigned long pfn);
