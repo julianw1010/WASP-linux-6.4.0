@@ -1498,19 +1498,6 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
     if (strcmp(level_name, "pte") == 0) {
         pte_t *src_pte = (pte_t *)src;
         num_entries = PTRS_PER_PTE;
-        
-        /* DEBUG: Count entries in primary that should have been tracked earlier */
-        {
-            int primary_nid = page_to_nid(pages[0]);
-            int actual_in_primary = 0;
-            for (j = 0; j < num_entries; j++) {
-                if (pte_val(src_pte[j]) != 0)
-                    actual_in_primary++;
-            }
-            pr_info("MITOSIS REPL_COPY: primary_nid=%d entries_in_page=%d tracked_on_node=%lld\n",
-                    primary_nid, actual_in_primary,
-                    atomic64_read(&mm->pgtable_entries_pte[primary_nid]));
-        }
 
         for (i = 1; i < count; i++) {
             pte_t *dst_pte = (pte_t *)page_address(pages[i]);
@@ -2168,6 +2155,463 @@ static void free_pgd_replicas(struct mm_struct *mm, int keep_node)
     }
 }
 
+struct mitosis_verify_counts {
+	/* Page table page counts per node */
+	int pgtable_count_pgd[NUMA_NODE_COUNT];
+	int pgtable_count_p4d[NUMA_NODE_COUNT];
+	int pgtable_count_pud[NUMA_NODE_COUNT];
+	int pgtable_count_pmd[NUMA_NODE_COUNT];
+	int pgtable_count_pte[NUMA_NODE_COUNT];
+
+	/* Populated entry counts per node */
+	s64 entry_count_pgd[NUMA_NODE_COUNT];
+	s64 entry_count_p4d[NUMA_NODE_COUNT];
+	s64 entry_count_pud[NUMA_NODE_COUNT];
+	s64 entry_count_pmd[NUMA_NODE_COUNT];
+	s64 entry_count_pte[NUMA_NODE_COUNT];
+};
+
+static void mitosis_verify_count_pte_page(struct mm_struct *mm, pmd_t *pmd,
+					  struct mitosis_verify_counts *counts)
+{
+	pte_t *pte_base;
+	struct page *page;
+	int node, i;
+
+	if (pmd_none(*pmd) || pmd_bad(*pmd) || pmd_trans_huge(*pmd))
+		return;
+
+	pte_base = (pte_t *)pmd_page_vaddr(*pmd);
+	if (!pte_base)
+		return;
+
+	page = virt_to_page(pte_base);
+	if (!page || !pfn_valid(page_to_pfn(page)))
+		return;
+
+	/* Skip if not owned by this mm */
+	if (READ_ONCE(page->pt_owner_mm) != mm)
+		return;
+
+	node = page_to_nid(page);
+	if (node < 0 || node >= NUMA_NODE_COUNT) {
+		pr_warn("[MITOSIS verify] PTE page on invalid node %d\n", node);
+		return;
+	}
+
+	counts->pgtable_count_pte[node]++;
+
+	/* Count populated entries */
+	for (i = 0; i < PTRS_PER_PTE; i++) {
+		if (pte_val(pte_base[i]) != 0)
+			counts->entry_count_pte[node]++;
+	}
+}
+
+static void mitosis_verify_count_pmd_page(struct mm_struct *mm, pud_t *pud,
+					  struct mitosis_verify_counts *counts)
+{
+	pmd_t *pmd_base;
+	struct page *page;
+	pmd_t pmd;
+	int node, i;
+
+	if (pud_none(*pud) || pud_bad(*pud) || pud_large(*pud))
+		return;
+
+	pmd_base = pmd_offset(pud, 0);
+	if (!pmd_base)
+		return;
+
+	page = virt_to_page(pmd_base);
+	if (!page || !pfn_valid(page_to_pfn(page)))
+		return;
+
+	/* Skip if not owned by this mm */
+	if (READ_ONCE(page->pt_owner_mm) != mm)
+		return;
+
+	node = page_to_nid(page);
+	if (node < 0 || node >= NUMA_NODE_COUNT) {
+		pr_warn("[MITOSIS verify] PMD page on invalid node %d\n", node);
+		return;
+	}
+
+	counts->pgtable_count_pmd[node]++;
+
+	/* Count populated entries and descend */
+	for (i = 0; i < PTRS_PER_PMD; i++) {
+		pmd = pmd_base[i];
+
+		if (pmd_none(pmd))
+			continue;
+
+		counts->entry_count_pmd[node]++;
+
+		/* Descend only if valid PTE table pointer (not huge page) */
+		if (!pmd_bad(pmd) && !pmd_trans_huge(pmd))
+			mitosis_verify_count_pte_page(mm, &pmd_base[i], counts);
+	}
+}
+
+static void mitosis_verify_count_pud_page(struct mm_struct *mm, p4d_t *p4d,
+					  struct mitosis_verify_counts *counts)
+{
+	pud_t *pud_base;
+	struct page *page;
+	pud_t pud;
+	int node, i;
+
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return;
+
+	pud_base = pud_offset(p4d, 0);
+	if (!pud_base)
+		return;
+
+	page = virt_to_page(pud_base);
+	if (!page || !pfn_valid(page_to_pfn(page)))
+		return;
+
+	/* Skip if not owned by this mm */
+	if (READ_ONCE(page->pt_owner_mm) != mm)
+		return;
+
+	node = page_to_nid(page);
+	if (node < 0 || node >= NUMA_NODE_COUNT) {
+		pr_warn("[MITOSIS verify] PUD page on invalid node %d\n", node);
+		return;
+	}
+
+	counts->pgtable_count_pud[node]++;
+
+	/* Count populated entries and descend */
+	for (i = 0; i < PTRS_PER_PUD; i++) {
+		pud = pud_base[i];
+
+		if (pud_none(pud))
+			continue;
+
+		counts->entry_count_pud[node]++;
+
+		/* Descend only if valid PMD table pointer (not huge page) */
+		if (!pud_bad(pud) && !pud_large(pud))
+			mitosis_verify_count_pmd_page(mm, &pud_base[i], counts);
+	}
+}
+
+static void mitosis_verify_count_p4d_page(struct mm_struct *mm, pgd_t *pgd,
+					  struct mitosis_verify_counts *counts)
+{
+	p4d_t *p4d_base;
+	p4d_t *p4d;
+	struct page *page;
+	p4d_t p4d_entry;
+	int node, i;
+
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return;
+
+	/* Handle P4D folded into PGD (4-level paging) */
+	if (!pgtable_l5_enabled()) {
+		p4d = (p4d_t *)pgd;
+		if (!p4d_none(*p4d) && !p4d_bad(*p4d))
+			mitosis_verify_count_pud_page(mm, p4d, counts);
+		return;
+	}
+
+	/* 5-level paging - P4D is a separate level */
+	p4d_base = (p4d_t *)pgd_page_vaddr(*pgd);
+	if (!p4d_base)
+		return;
+
+	page = virt_to_page(p4d_base);
+	if (!page || !pfn_valid(page_to_pfn(page)))
+		return;
+
+	/* Skip if not owned by this mm */
+	if (READ_ONCE(page->pt_owner_mm) != mm)
+		return;
+
+	node = page_to_nid(page);
+	if (node < 0 || node >= NUMA_NODE_COUNT) {
+		pr_warn("[MITOSIS verify] P4D page on invalid node %d\n", node);
+		return;
+	}
+
+	counts->pgtable_count_p4d[node]++;
+
+	/* Count populated entries and descend */
+	for (i = 0; i < PTRS_PER_P4D; i++) {
+		p4d_entry = p4d_base[i];
+
+		if (p4d_none(p4d_entry))
+			continue;
+
+		counts->entry_count_p4d[node]++;
+
+		if (!p4d_bad(p4d_entry))
+			mitosis_verify_count_pud_page(mm, &p4d_base[i], counts);
+	}
+}
+
+static void mitosis_verify_count_pgd(struct mm_struct *mm, pgd_t *pgd,
+				     struct mitosis_verify_counts *counts)
+{
+	struct page *page;
+	struct page *target;
+	pgd_t entry;
+	p4d_t *p4d;
+	pud_t *pud_base;
+	int node, i;
+
+	if (!pgd)
+		return;
+
+	page = virt_to_page(pgd);
+	if (!page || !pfn_valid(page_to_pfn(page)))
+		return;
+
+	/* Skip if not owned by this mm */
+	if (READ_ONCE(page->pt_owner_mm) != mm)
+		return;
+
+	node = page_to_nid(page);
+	if (node < 0 || node >= NUMA_NODE_COUNT) {
+		pr_warn("[MITOSIS verify] PGD page on invalid node %d\n", node);
+		return;
+	}
+
+	counts->pgtable_count_pgd[node]++;
+
+	/* Only count user-space entries (below KERNEL_PGD_BOUNDARY) */
+	for (i = 0; i < KERNEL_PGD_BOUNDARY; i++) {
+		entry = pgd[i];
+
+		if (pgd_none(entry))
+			continue;
+
+		/*
+		 * For PGD entries, check if the target page belongs to us
+		 * before counting. Kernel-cloned entries point to kernel
+		 * pages (pt_owner_mm != mm).
+		 */
+		if (pgtable_l5_enabled()) {
+			/* 5-level: PGD points to P4D page */
+			target = virt_to_page(pgd_page_vaddr(entry));
+			if (!target || READ_ONCE(target->pt_owner_mm) != mm)
+				continue;
+		} else {
+			/* 4-level: PGD is folded with P4D, points to PUD page */
+			p4d = (p4d_t *)&pgd[i];
+			if (p4d_none(*p4d) || p4d_bad(*p4d))
+				continue;
+			pud_base = pud_offset(p4d, 0);
+			target = virt_to_page(pud_base);
+			if (!target || READ_ONCE(target->pt_owner_mm) != mm)
+				continue;
+		}
+
+		counts->entry_count_pgd[node]++;
+		mitosis_verify_count_p4d_page(mm, &pgd[i], counts);
+	}
+}
+
+void mitosis_verify_mm_tracking(struct mm_struct *mm)
+{
+	struct mitosis_verify_counts actual;
+	int node, i;
+	bool mismatch = false;
+	bool has_any_tracking = false;
+	int tracked_pages;
+	int counted_pages;
+	s64 tracked_entries;
+	s64 counted_entries;
+
+	if (!mm || mm == &init_mm)
+		return;
+
+	/* Only verify if mitosis tracking was active */
+	if (!mm->repl_pgd_enabled && !mm->cache_only_mode)
+		return;
+
+	memset(&actual, 0, sizeof(actual));
+
+	/* Walk primary PGD */
+	mitosis_verify_count_pgd(mm, mm->pgd, &actual);
+
+	/* Walk all replica PGDs (skip if same as primary) */
+	if (mm->repl_pgd_enabled) {
+		for (i = 0; i < NUMA_NODE_COUNT; i++) {
+			if (mm->pgd_replicas[i] && mm->pgd_replicas[i] != mm->pgd)
+				mitosis_verify_count_pgd(mm, mm->pgd_replicas[i], &actual);
+		}
+	}
+
+	/* Compare with tracked values (primary + replica counts) */
+	for (node = 0; node < NUMA_NODE_COUNT; node++) {
+		s64 tracked_replicas;
+
+		/* === PGD pages === */
+		tracked_replicas = atomic64_read(&mm->mitosis_pgd_replicas[node]);
+		tracked_pages = atomic_read(&mm->pgtable_alloc_pgd[node]) + (int)tracked_replicas;
+		counted_pages = actual.pgtable_count_pgd[node];
+		if (tracked_pages != 0 || counted_pages != 0)
+			has_any_tracking = true;
+		if (tracked_pages != counted_pages) {
+			pr_warn("[MITOSIS verify] PGD pages node %d: tracked=%d (alloc=%d + repl=%lld) actual=%d (diff=%d)\n",
+				node, tracked_pages,
+				atomic_read(&mm->pgtable_alloc_pgd[node]), tracked_replicas,
+				counted_pages, tracked_pages - counted_pages);
+			mismatch = true;
+		}
+
+		/* === P4D pages (only with 5-level paging) === */
+		if (pgtable_l5_enabled()) {
+			tracked_replicas = atomic64_read(&mm->mitosis_p4d_replicas[node]);
+			tracked_pages = atomic_read(&mm->pgtable_alloc_p4d[node]) + (int)tracked_replicas;
+			counted_pages = actual.pgtable_count_p4d[node];
+			if (tracked_pages != 0 || counted_pages != 0)
+				has_any_tracking = true;
+			if (tracked_pages != counted_pages) {
+				pr_warn("[MITOSIS verify] P4D pages node %d: tracked=%d (alloc=%d + repl=%lld) actual=%d (diff=%d)\n",
+					node, tracked_pages,
+					atomic_read(&mm->pgtable_alloc_p4d[node]), tracked_replicas,
+					counted_pages, tracked_pages - counted_pages);
+				mismatch = true;
+			}
+		}
+
+		/* === PUD pages === */
+		tracked_replicas = atomic64_read(&mm->mitosis_pud_replicas[node]);
+		tracked_pages = atomic_read(&mm->pgtable_alloc_pud[node]) + (int)tracked_replicas;
+		counted_pages = actual.pgtable_count_pud[node];
+		if (tracked_pages != 0 || counted_pages != 0)
+			has_any_tracking = true;
+		if (tracked_pages != counted_pages) {
+			pr_warn("[MITOSIS verify] PUD pages node %d: tracked=%d (alloc=%d + repl=%lld) actual=%d (diff=%d)\n",
+				node, tracked_pages,
+				atomic_read(&mm->pgtable_alloc_pud[node]), tracked_replicas,
+				counted_pages, tracked_pages - counted_pages);
+			mismatch = true;
+		}
+
+		/* === PMD pages === */
+		tracked_replicas = atomic64_read(&mm->mitosis_pmd_replicas[node]);
+		tracked_pages = atomic_read(&mm->pgtable_alloc_pmd[node]) + (int)tracked_replicas;
+		counted_pages = actual.pgtable_count_pmd[node];
+		if (tracked_pages != 0 || counted_pages != 0)
+			has_any_tracking = true;
+		if (tracked_pages != counted_pages) {
+			pr_warn("[MITOSIS verify] PMD pages node %d: tracked=%d (alloc=%d + repl=%lld) actual=%d (diff=%d)\n",
+				node, tracked_pages,
+				atomic_read(&mm->pgtable_alloc_pmd[node]), tracked_replicas,
+				counted_pages, tracked_pages - counted_pages);
+			mismatch = true;
+		}
+
+		/* === PTE pages === */
+		tracked_replicas = atomic64_read(&mm->mitosis_pte_replicas[node]);
+		tracked_pages = atomic_read(&mm->pgtable_alloc_pte[node]) + (int)tracked_replicas;
+		counted_pages = actual.pgtable_count_pte[node];
+		if (tracked_pages != 0 || counted_pages != 0)
+			has_any_tracking = true;
+		if (tracked_pages != counted_pages) {
+			pr_warn("[MITOSIS verify] PTE pages node %d: tracked=%d (alloc=%d + repl=%lld) actual=%d (diff=%d)\n",
+				node, tracked_pages,
+				atomic_read(&mm->pgtable_alloc_pte[node]), tracked_replicas,
+				counted_pages, tracked_pages - counted_pages);
+			mismatch = true;
+		}
+
+		/* === PGD entries === */
+		tracked_entries = atomic64_read(&mm->pgtable_entries_pgd[node]);
+		counted_entries = actual.entry_count_pgd[node];
+		if (tracked_entries != 0 || counted_entries != 0)
+			has_any_tracking = true;
+		if (tracked_entries != counted_entries) {
+			pr_warn("[MITOSIS verify] PGD entries node %d: tracked=%lld actual=%lld (diff=%lld)\n",
+				node, tracked_entries, counted_entries,
+				tracked_entries - counted_entries);
+			mismatch = true;
+		}
+
+		/* === P4D entries (only with 5-level paging) === */
+		if (pgtable_l5_enabled()) {
+			tracked_entries = atomic64_read(&mm->pgtable_entries_p4d[node]);
+			counted_entries = actual.entry_count_p4d[node];
+			if (tracked_entries != 0 || counted_entries != 0)
+				has_any_tracking = true;
+			if (tracked_entries != counted_entries) {
+				pr_warn("[MITOSIS verify] P4D entries node %d: tracked=%lld actual=%lld (diff=%lld)\n",
+					node, tracked_entries, counted_entries,
+					tracked_entries - counted_entries);
+				mismatch = true;
+			}
+		}
+
+		/* === PUD entries === */
+		tracked_entries = atomic64_read(&mm->pgtable_entries_pud[node]);
+		counted_entries = actual.entry_count_pud[node];
+		if (tracked_entries != 0 || counted_entries != 0)
+			has_any_tracking = true;
+		if (tracked_entries != counted_entries) {
+			pr_warn("[MITOSIS verify] PUD entries node %d: tracked=%lld actual=%lld (diff=%lld)\n",
+				node, tracked_entries, counted_entries,
+				tracked_entries - counted_entries);
+			mismatch = true;
+		}
+
+		/* === PMD entries === */
+		tracked_entries = atomic64_read(&mm->pgtable_entries_pmd[node]);
+		counted_entries = actual.entry_count_pmd[node];
+		if (tracked_entries != 0 || counted_entries != 0)
+			has_any_tracking = true;
+		if (tracked_entries != counted_entries) {
+			pr_warn("[MITOSIS verify] PMD entries node %d: tracked=%lld actual=%lld (diff=%lld)\n",
+				node, tracked_entries, counted_entries,
+				tracked_entries - counted_entries);
+			mismatch = true;
+		}
+
+		/* === PTE entries === */
+		tracked_entries = atomic64_read(&mm->pgtable_entries_pte[node]);
+		counted_entries = actual.entry_count_pte[node];
+		if (tracked_entries != 0 || counted_entries != 0)
+			has_any_tracking = true;
+		if (tracked_entries != counted_entries) {
+			pr_warn("[MITOSIS verify] PTE entries node %d: tracked=%lld actual=%lld (diff=%lld)\n",
+				node, tracked_entries, counted_entries,
+				tracked_entries - counted_entries);
+			mismatch = true;
+		}
+	}
+
+	if (mismatch) {
+		pr_warn("[MITOSIS verify] === TRACKING MISMATCH for pid %d (%s) ===\n",
+			mm->mitosis_owner_pid, mm->mitosis_owner_comm);
+		pr_warn("[MITOSIS verify] repl_pgd_enabled=%d cache_only_mode=%d\n",
+			mm->repl_pgd_enabled, mm->cache_only_mode);
+
+		/* Print debug counters */
+		pr_warn("[MITOSIS verify] Debug: track_pte_inc_calls=%lld track_pte_dec_calls=%lld\n",
+			atomic64_read(&mm->debug_track_pte_inc_calls),
+			atomic64_read(&mm->debug_track_pte_dec_calls));
+
+		for (node = 0; node < NUMA_NODE_COUNT; node++) {
+			s64 inc = atomic64_read(&mm->debug_pte_inc_per_node[node]);
+			s64 dec = atomic64_read(&mm->debug_pte_dec_per_node[node]);
+			if (inc != 0 || dec != 0) {
+				pr_warn("[MITOSIS verify] Debug node %d: pte_inc=%lld pte_dec=%lld net=%lld\n",
+					node, inc, dec, inc - dec);
+			}
+		}
+	} else if (has_any_tracking) {
+		pr_info("[MITOSIS verify] Tracking verified OK for pid %d (%s)\n",
+			mm->mitosis_owner_pid, mm->mitosis_owner_comm);
+	}
+}
+
 void pgtable_repl_disable(struct mm_struct *mm)
 {
     unsigned long flags;
@@ -2185,6 +2629,9 @@ void pgtable_repl_disable(struct mm_struct *mm)
     }
 
     mutex_lock(&mm->repl_mutex);
+    
+    /* Verify tracking BEFORE we tear everything down */
+    mitosis_verify_mm_tracking(mm);
 
     if (mm->repl_pgd_enabled && mm->mitosis_repl_start_time != 0) {
         mitosis_stats_record_mm(mm);
