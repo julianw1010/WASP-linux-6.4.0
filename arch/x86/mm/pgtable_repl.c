@@ -500,11 +500,10 @@ static int alloc_pte_replicas(struct page *base_page, struct mm_struct *mm,
         new_page = mitosis_alloc_replica_page(i, 0);
 
         BUG_ON(!pgtable_pte_page_ctor(new_page));
-
-        /* Account for this replica PTE */
         mm_inc_nr_ptes(mm);
 
         WRITE_ONCE(new_page->pt_replica, NULL);
+        new_page->pt_owner_mm = mm;
         pages[(*count)++] = new_page;
     }
 
@@ -548,11 +547,10 @@ static int alloc_pmd_replicas(struct page *base_page, struct mm_struct *mm,
         new_page = mitosis_alloc_replica_page(i, 0);
 
         BUG_ON(!pgtable_pmd_page_ctor(new_page));
-
-        /* Account for this replica PMD */
         mm_inc_nr_pmds(mm);
 
         WRITE_ONCE(new_page->pt_replica, NULL);
+        new_page->pt_owner_mm = mm;
         pages[(*count)++] = new_page;
     }
 
@@ -595,10 +593,10 @@ static int alloc_pud_replicas(struct page *base_page, struct mm_struct *mm,
 
         new_page = mitosis_alloc_replica_page(i, 0);
 
-        /* Account for this replica PUD */
         mm_inc_nr_puds(mm);
 
         WRITE_ONCE(new_page->pt_replica, NULL);
+        new_page->pt_owner_mm = mm;
         pages[(*count)++] = new_page;
     }
 
@@ -641,9 +639,8 @@ static int alloc_p4d_replicas(struct page *base_page, struct mm_struct *mm,
 
         new_page = mitosis_alloc_replica_page(i, 0);
 
-        /* No mm_inc_nr_p4ds - kernel doesn't track P4D pages separately */
-
         WRITE_ONCE(new_page->pt_replica, NULL);
+        new_page->pt_owner_mm = mm;
         pages[(*count)++] = new_page;
     }
 
@@ -682,6 +679,7 @@ static int alloc_pgd_replicas(struct page *base_page, nodemask_t nodes,
         new_page = mitosis_alloc_replica_page(i, alloc_order);
 
         WRITE_ONCE(new_page->pt_replica, NULL);
+        /* Note: pt_owner_mm for PGD is set in pgtable_repl_enable() after this call */
         pages[(*count)++] = new_page;
     }
 
@@ -699,9 +697,17 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     pte_t old_val;
     int node;
     
+    static atomic_t with_replica_calls = ATOMIC_INIT(0);
+    static atomic_t with_replica_mm_null = ATOMIC_INIT(0);
+    static atomic_t with_replica_mm_init = ATOMIC_INIT(0);
+    static atomic_t with_replica_tracked = ATOMIC_INIT(0);
+    static atomic_t no_replica_calls = ATOMIC_INIT(0);
+    static atomic_t no_replica_mm_null = ATOMIC_INIT(0);
+    static atomic_t no_replica_tracked = ATOMIC_INIT(0);
+    
     if (!mitosis_tracking_initialized) {
-    native_set_pte(ptep, pteval);
-    return;
+        native_set_pte(ptep, pteval);
+        return;
     }
 
     if (!ptep) {
@@ -722,24 +728,29 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
         return;
     }
 
-    /* Get mm_struct from page owner for entry tracking */
     mm = READ_ONCE(pte_page->pt_owner_mm);
 
     if (!READ_ONCE(pte_page->pt_replica)) {
-        /* No replicas - track entries unconditionally */
+        /* No replicas path */
+        int call_num = atomic_inc_return(&no_replica_calls);
+        
+        if (!mm || mm == &init_mm) {
+            atomic_inc(&no_replica_mm_null);
+        }
+        
         if (mm && mm != &init_mm) {
             node = page_to_nid(pte_page);
             old_val = READ_ONCE(*ptep);
             
             native_set_pte(ptep, pteval);
             
-            /* Track entry population changes */
             if (node >= 0 && node < NUMA_NODE_COUNT) {
                 bool was_populated = (pte_val(old_val) != 0);
                 bool is_populated = (pte_val(pteval) != 0);
                 
                 if (!was_populated && is_populated) {
                     track_pte_entry(mm, node, true);
+                    atomic_inc(&no_replica_tracked);
                 } else if (was_populated && !is_populated) {
                     track_pte_entry(mm, node, false);
                 }
@@ -747,7 +758,30 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
         } else {
             native_set_pte(ptep, pteval);
         }
+        
+        if (call_num % 50000 == 0) {
+            pr_info("MITOSIS set_pte NO_REPLICA: calls=%d mm_null=%d tracked=%d\n",
+                    call_num, atomic_read(&no_replica_mm_null),
+                    atomic_read(&no_replica_tracked));
+        }
         return;
+    }
+
+    /* HAS replicas path */
+    {
+        int call_num = atomic_inc_return(&with_replica_calls);
+        
+        if (!mm)
+            atomic_inc(&with_replica_mm_null);
+        else if (mm == &init_mm)
+            atomic_inc(&with_replica_mm_init);
+
+        if (call_num % 50000 == 0) {
+            pr_info("MITOSIS set_pte WITH_REPLICA: calls=%d mm_null=%d mm_init=%d tracked=%d\n",
+                    call_num, atomic_read(&with_replica_mm_null),
+                    atomic_read(&with_replica_mm_init),
+                    atomic_read(&with_replica_tracked));
+        }
     }
 
     if (pte_val(pteval) == 0)
@@ -761,22 +795,20 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
 
     do {
         pte_t *replica_entry = (pte_t *)(page_address(cur_page) + offset);
-        pte_t old_val = READ_ONCE(*replica_entry);
-        int node = page_to_nid(cur_page);
+        pte_t old_entry = READ_ONCE(*replica_entry);
+        int cur_node = page_to_nid(cur_page);
         
         WRITE_ONCE(*replica_entry, pteval);
         
-        /* Track entry population changes if we have mm context */
-        if (mm && mm != &init_mm && node >= 0 && node < NUMA_NODE_COUNT) {
-            bool was_populated = (pte_val(old_val) != 0);
+        if (mm && mm != &init_mm && cur_node >= 0 && cur_node < NUMA_NODE_COUNT) {
+            bool was_populated = (pte_val(old_entry) != 0);
             bool is_populated = (pte_val(pteval) != 0);
             
             if (!was_populated && is_populated) {
-                /* Entry became populated */
-                track_pte_entry(mm, node, true);
+                track_pte_entry(mm, cur_node, true);
+                atomic_inc(&with_replica_tracked);
             } else if (was_populated && !is_populated) {
-                /* Entry became empty */
-                track_pte_entry(mm, node, false);
+                track_pte_entry(mm, cur_node, false);
             }
         }
         
@@ -1524,8 +1556,7 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
     void *src;
     int i, j, ret;
     int num_entries;
-    int primary_nid;
-    bool p4d_track_as_pgd = !pgtable_l5_enabled();  /* P4D folded into PGD */
+    bool p4d_track_as_pgd = !pgtable_l5_enabled();
 
     if (!page || !mm || !alloc_fn || !mm->repl_in_progress)
         return false;
@@ -1540,89 +1571,70 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
     BUG_ON(!link_page_replicas(pages, count));
 
     src = page_address(page);
-    primary_nid = page_to_nid(pages[0]);
-    
-    /* Copy entries to replicas and track only the new replica entries.
-     * Primary (index 0) entries were already tracked when initially set. */
+
+    /* Copy to replicas and track ONLY replica entries (primary already tracked) */
     if (strcmp(level_name, "pte") == 0) {
         pte_t *src_pte = (pte_t *)src;
-        pte_t *dst_pte;
-        pte_t val;
-        int nid;
-        
         num_entries = PTRS_PER_PTE;
-        
+
         for (i = 1; i < count; i++) {
-            dst_pte = (pte_t *)page_address(pages[i]);
-            nid = page_to_nid(pages[i]);
-            
+            pte_t *dst_pte = (pte_t *)page_address(pages[i]);
+            int nid = page_to_nid(pages[i]);
+
             for (j = 0; j < num_entries; j++) {
-                val = READ_ONCE(src_pte[j]);
+                pte_t val = READ_ONCE(src_pte[j]);
                 WRITE_ONCE(dst_pte[j], val);
-                
                 if (pte_val(val) != 0)
                     track_pte_entry(mm, nid, true);
             }
             clflush_cache_range(dst_pte, PAGE_SIZE);
         }
+
     } else if (strcmp(level_name, "pmd") == 0) {
         pmd_t *src_pmd = (pmd_t *)src;
-        pmd_t *dst_pmd;
-        pmd_t val;
-        int nid;
-        
         num_entries = PTRS_PER_PMD;
-        
+
         for (i = 1; i < count; i++) {
-            dst_pmd = (pmd_t *)page_address(pages[i]);
-            nid = page_to_nid(pages[i]);
-            
+            pmd_t *dst_pmd = (pmd_t *)page_address(pages[i]);
+            int nid = page_to_nid(pages[i]);
+
             for (j = 0; j < num_entries; j++) {
-                val = READ_ONCE(src_pmd[j]);
+                pmd_t val = READ_ONCE(src_pmd[j]);
                 WRITE_ONCE(dst_pmd[j], val);
-                
                 if (pmd_val(val) != 0)
                     track_pmd_entry(mm, nid, true);
             }
             clflush_cache_range(dst_pmd, PAGE_SIZE);
         }
+
     } else if (strcmp(level_name, "pud") == 0) {
         pud_t *src_pud = (pud_t *)src;
-        pud_t *dst_pud;
-        pud_t val;
-        int nid;
-        
         num_entries = PTRS_PER_PUD;
-        
+
         for (i = 1; i < count; i++) {
-            dst_pud = (pud_t *)page_address(pages[i]);
-            nid = page_to_nid(pages[i]);
-            
+            pud_t *dst_pud = (pud_t *)page_address(pages[i]);
+            int nid = page_to_nid(pages[i]);
+
             for (j = 0; j < num_entries; j++) {
-                val = READ_ONCE(src_pud[j]);
+                pud_t val = READ_ONCE(src_pud[j]);
                 WRITE_ONCE(dst_pud[j], val);
-                
                 if (pud_val(val) != 0)
                     track_pud_entry(mm, nid, true);
             }
             clflush_cache_range(dst_pud, PAGE_SIZE);
         }
+
     } else if (strcmp(level_name, "p4d") == 0) {
         p4d_t *src_p4d = (p4d_t *)src;
-        p4d_t *dst_p4d;
-        p4d_t val;
-        int nid;
-        
         num_entries = PTRS_PER_P4D;
-        
+
         for (i = 1; i < count; i++) {
-            dst_p4d = (p4d_t *)page_address(pages[i]);
-            nid = page_to_nid(pages[i]);
-            
+            p4d_t *dst_p4d = (p4d_t *)page_address(pages[i]);
+            int nid = page_to_nid(pages[i]);
+
             for (j = 0; j < num_entries; j++) {
-                val = READ_ONCE(src_p4d[j]);
+                p4d_t val = READ_ONCE(src_p4d[j]);
                 WRITE_ONCE(dst_p4d[j], val);
-                
                 if (p4d_val(val) != 0) {
                     if (p4d_track_as_pgd)
                         track_pgd_entry(mm, nid, true);
@@ -1958,6 +1970,11 @@ int pgtable_repl_enable(struct mm_struct *mm, nodemask_t nodes)
     ret = alloc_pgd_replicas(base_page, nodes, pgd_pages, &count);
     if (ret)
         goto fail_cleanup;
+        
+    /* Set pt_owner_mm on all PGD pages including replicas */
+    for (i = 0; i < count; i++) {
+        pgd_pages[i]->pt_owner_mm = mm;
+    }
 
     /* Copy ALL entries to replicas, but only track user entries */
     for (i = 1; i < count; i++) {
@@ -2344,6 +2361,7 @@ void pgtable_repl_alloc_pte(struct mm_struct *mm, unsigned long pfn)
     if (ret != 0 || count < 2)
         return;
 
+    /* Just copy - entries will be tracked when set via set_pte() */
     for (i = 1; i < count; i++) {
         memcpy(page_address(pages[i]), src_addr, PAGE_SIZE);
         clflush_cache_range(page_address(pages[i]), PAGE_SIZE);
@@ -2384,6 +2402,7 @@ void pgtable_repl_alloc_pmd(struct mm_struct *mm, unsigned long pfn)
     if (ret != 0 || count < 2)
         return;
 
+    /* Just copy - entries will be tracked when set via set_pmd() */
     for (i = 1; i < count; i++) {
         memcpy(page_address(pages[i]), src_addr, PAGE_SIZE);
         clflush_cache_range(page_address(pages[i]), PAGE_SIZE);
@@ -2422,6 +2441,7 @@ void pgtable_repl_alloc_pud(struct mm_struct *mm, unsigned long pfn)
     if (ret != 0 || count < 2)
         return;
 
+    /* Just copy - entries will be tracked when set via set_pud() */
     for (i = 1; i < count; i++) {
         memcpy(page_address(pages[i]), src_addr, PAGE_SIZE);
         clflush_cache_range(page_address(pages[i]), PAGE_SIZE);
@@ -2460,6 +2480,7 @@ void pgtable_repl_alloc_p4d(struct mm_struct *mm, unsigned long pfn)
     if (ret != 0 || count < 2)
         return;
 
+    /* Just copy - entries will be tracked when set via set_p4d() */
     for (i = 1; i < count; i++) {
         memcpy(page_address(pages[i]), src_addr, PAGE_SIZE);
         clflush_cache_range(page_address(pages[i]), PAGE_SIZE);

@@ -56,6 +56,160 @@ extern atomic_t repl_release_pte_calls;
 extern atomic_t repl_release_pte_freed;
 
 /*
+ * Add to arch/x86/mm/pgtable_repl.c or mitosis_stats.c
+ * 
+ * Verification scan: Walk all page tables and count actual non-none entries,
+ * compare to tracked counts to identify missed entries.
+ */
+void mitosis_verify_entry_counts(struct mm_struct *mm)
+{
+    int node;
+    u64 actual_pte[NUMA_NODE_COUNT] = {0};
+    u64 total_tracked = 0, total_actual = 0;
+    s64 tracked, diff;
+    bool is_5level = pgtable_l5_enabled();
+
+    if (!mm || mm == &init_mm)
+        return;
+
+    pr_info("MITOSIS: Verifying entry counts for mm %px (PID %d) [%d-level paging]\n",
+            mm, mm->mitosis_owner_pid, is_5level ? 5 : 4);
+
+    /* Walk EACH node's replica separately */
+    for_each_node_mask(node, mm->repl_pgd_nodes) {
+        pgd_t *pgd;
+        int pgd_idx, pud_idx, pmd_idx, pte_idx;
+
+        if (node >= NUMA_NODE_COUNT)
+            continue;
+
+        pgd = mm->pgd_replicas[node];
+        if (!pgd)
+            continue;
+
+        /* Walk this node's replica */
+        for (pgd_idx = 0; pgd_idx < KERNEL_PGD_BOUNDARY; pgd_idx++) {
+            pgd_t pgdval = READ_ONCE(pgd[pgd_idx]);
+            pud_t *pud_base;
+            unsigned long pud_phys;
+
+            if (pgd_none(pgdval) || !pgd_present(pgdval))
+                continue;
+
+            if (is_5level) {
+                /* 5-level: PGD -> P4D -> PUD -> PMD -> PTE */
+                p4d_t *p4d_base;
+                int p4d_idx;
+
+                p4d_base = (p4d_t *)__va(pgd_val(pgdval) & PTE_PFN_MASK);
+                if (!virt_addr_valid(p4d_base))
+                    continue;
+
+                for (p4d_idx = 0; p4d_idx < PTRS_PER_P4D; p4d_idx++) {
+                    p4d_t p4dval = READ_ONCE(p4d_base[p4d_idx]);
+
+                    if (p4d_none(p4dval) || !p4d_present(p4dval))
+                        continue;
+
+                    pud_phys = p4d_val(p4dval) & PTE_PFN_MASK;
+                    pud_base = (pud_t *)__va(pud_phys);
+                    if (!virt_addr_valid(pud_base))
+                        continue;
+
+                    goto walk_pud;
+                }
+                continue;
+            } else {
+                /* 4-level: PGD -> PUD -> PMD -> PTE (P4D folded into PGD) */
+                pud_phys = pgd_val(pgdval) & PTE_PFN_MASK;
+                pud_base = (pud_t *)__va(pud_phys);
+                if (!virt_addr_valid(pud_base))
+                    continue;
+            }
+
+walk_pud:
+            for (pud_idx = 0; pud_idx < PTRS_PER_PUD; pud_idx++) {
+                pud_t pudval = READ_ONCE(pud_base[pud_idx]);
+                pmd_t *pmd_base;
+                unsigned long pmd_phys;
+
+                if (pud_none(pudval) || !pud_present(pudval))
+                    continue;
+                if (pud_trans_huge(pudval))
+                    continue;
+
+                pmd_phys = pud_val(pudval) & PTE_PFN_MASK;
+                pmd_base = (pmd_t *)__va(pmd_phys);
+                if (!virt_addr_valid(pmd_base))
+                    continue;
+
+                for (pmd_idx = 0; pmd_idx < PTRS_PER_PMD; pmd_idx++) {
+                    pmd_t pmdval = READ_ONCE(pmd_base[pmd_idx]);
+                    pte_t *pte_base;
+                    unsigned long pte_phys;
+
+                    if (pmd_none(pmdval) || !pmd_present(pmdval))
+                        continue;
+                    if (pmd_trans_huge(pmdval))
+                        continue;
+
+                    pte_phys = pmd_val(pmdval) & PTE_PFN_MASK;
+                    pte_base = (pte_t *)__va(pte_phys);
+                    if (!virt_addr_valid(pte_base))
+                        continue;
+
+                    for (pte_idx = 0; pte_idx < PTRS_PER_PTE; pte_idx++) {
+                        pte_t pteval = READ_ONCE(pte_base[pte_idx]);
+
+                        if (!pte_none(pteval))
+                            actual_pte[node]++;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Print comparison table */
+    pr_info("MITOSIS: PTE Entry count verification (all replicas):\n");
+    pr_info("  Node    Tracked    Actual       Diff\n");
+
+    for_each_online_node(node) {
+        if (node >= NUMA_NODE_COUNT)
+            continue;
+
+        tracked = atomic64_read(&mm->pgtable_entries_pte[node]);
+        diff = (s64)actual_pte[node] - tracked;
+
+        pr_info("  %4d %10lld %10llu %+10lld%s\n",
+                node, tracked, actual_pte[node], diff,
+                diff != 0 ? " ***MISMATCH***" : "");
+
+        total_tracked += tracked;
+        total_actual += actual_pte[node];
+    }
+
+    pr_info("  TOTAL %10llu %10llu %+10lld\n",
+            total_tracked, total_actual,
+            (s64)total_actual - (s64)total_tracked);
+
+    if (total_actual != total_tracked && total_actual > 0) {
+        s64 delta = (s64)total_actual - (s64)total_tracked;
+        u64 abs_delta = delta < 0 ? -delta : delta;
+        u64 base = delta < 0 ? total_tracked : total_actual;
+        u64 pct_int = base > 0 ? (abs_delta * 100 / base) : 0;
+        pr_warn("MITOSIS: Entry count %s by %llu (%llu%%)\n",
+                delta > 0 ? "UNDER-reported" : "OVER-reported",
+                abs_delta, pct_int);
+    }
+
+    /* Also print unique entry count (should be same across all nodes) */
+    if (actual_pte[0] > 0) {
+        pr_info("MITOSIS: Unique entries per replica: ~%llu (Hydra comparable)\n",
+                actual_pte[0]);
+    }
+}
+
+/*
  * Record mm stats to history when replication is disabled or process exits.
  * Each record gets a unique seq_id to handle PID reuse.
  */
@@ -69,6 +223,9 @@ void mitosis_stats_record_mm(struct mm_struct *mm)
             return;
         if (mm->mitosis_repl_start_time == 0)
             return;
+            
+        /* Add at the beginning: */
+        mitosis_verify_entry_counts(mm);
 
 	stats = kmalloc(sizeof(*stats), GFP_KERNEL);
 	if (!stats)
