@@ -69,10 +69,9 @@ void mitosis_verify_entry_counts(struct mm_struct *mm)
     s64 tracked, diff;
     bool is_5level = pgtable_l5_enabled();
     
-    /* For debugging - track first mismatched node's extras */
-    int debug_node = -1;
-    s64 debug_tracked = 0;
-
+    /* Track untracked entries for analysis */
+    int untracked_count = 0;
+    
     if (!mm || mm == &init_mm)
         return;
 
@@ -83,6 +82,7 @@ void mitosis_verify_entry_counts(struct mm_struct *mm)
     for_each_node_mask(node, mm->repl_pgd_nodes) {
         pgd_t *pgd;
         int pgd_idx, pud_idx, pmd_idx, pte_idx;
+        s64 running_tracked;
 
         if (node >= NUMA_NODE_COUNT)
             continue;
@@ -92,12 +92,7 @@ void mitosis_verify_entry_counts(struct mm_struct *mm)
             continue;
             
         tracked = atomic64_read(&mm->pgtable_entries_pte[node]);
-        
-        /* Remember first node for debug output */
-        if (debug_node == -1) {
-            debug_node = node;
-            debug_tracked = tracked;
-        }
+        running_tracked = 0;  /* Count as we go */
 
         /* Walk this node's replica */
         for (pgd_idx = 0; pgd_idx < KERNEL_PGD_BOUNDARY; pgd_idx++) {
@@ -157,6 +152,9 @@ walk_pud:
                     pmd_t pmdval = READ_ONCE(pmd_base[pmd_idx]);
                     pte_t *pte_base;
                     unsigned long pte_phys;
+                    struct page *pte_page;
+                    struct mm_struct *owner_mm;
+                    bool has_replica;
 
                     if (pmd_none(pmdval) || !pmd_present(pmdval))
                         continue;
@@ -168,21 +166,31 @@ walk_pud:
                     if (!virt_addr_valid(pte_base))
                         continue;
 
+                    pte_page = virt_to_page(pte_base);
+                    owner_mm = READ_ONCE(pte_page->pt_owner_mm);
+                    has_replica = (READ_ONCE(pte_page->pt_replica) != NULL);
+
                     for (pte_idx = 0; pte_idx < PTRS_PER_PTE; pte_idx++) {
                         pte_t pteval = READ_ONCE(pte_base[pte_idx]);
 
                         if (!pte_none(pteval)) {
                             actual_pte[node]++;
+                            running_tracked++;
                             
-                            /* Debug: print extras on first node only */
-                            if (node == debug_node && 
-                                (s64)actual_pte[node] > debug_tracked) {
-                                struct page *pte_page = virt_to_page(pte_base);
-                                pr_warn("MITOSIS EXTRA[%llu]: pte_base=%px idx=%d val=%lx "
-                                        "page=%px owner_mm=%px\n",
-                                        actual_pte[node] - debug_tracked,
-                                        pte_base, pte_idx, pte_val(pteval),
-                                        pte_page, pte_page->pt_owner_mm);
+                            /* Check if this entry SHOULD have been tracked */
+                            if (running_tracked > tracked && untracked_count < 30) {
+                                untracked_count++;
+                                pr_warn("MITOSIS UNTRACKED[%d]: node=%d idx=%d val=%lx "
+                                        "owner_mm=%px (expected=%px) has_repl=%d "
+                                        "from_cache=%d vaddr=%lx\n",
+                                        untracked_count, node, pte_idx, 
+                                        pte_val(pteval),
+                                        owner_mm, mm, has_replica,
+                                        PageMitosisFromCache(pte_page),
+                                        ((unsigned long)pgd_idx << PGDIR_SHIFT) |
+                                        ((unsigned long)pud_idx << PUD_SHIFT) |
+                                        ((unsigned long)pmd_idx << PMD_SHIFT) |
+                                        ((unsigned long)pte_idx << PAGE_SHIFT));
                             }
                         }
                     }
@@ -222,11 +230,6 @@ walk_pud:
         pr_warn("MITOSIS: Entry count %s by %llu (%llu%%)\n",
                 delta > 0 ? "UNDER-reported" : "OVER-reported",
                 abs_delta, pct_int);
-    }
-
-    if (actual_pte[0] > 0) {
-        pr_info("MITOSIS: Unique entries per replica: ~%llu (Hydra comparable)\n",
-                actual_pte[0]);
     }
 }
 

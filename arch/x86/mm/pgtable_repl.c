@@ -696,6 +696,7 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     struct mm_struct *mm = NULL;
     pte_t old_val;
     int node;
+    int idx;
     
     if (!mitosis_tracking_initialized) {
         native_set_pte(ptep, pteval);
@@ -721,34 +722,17 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     }
 
     mm = READ_ONCE(pte_page->pt_owner_mm);
+    offset = ((unsigned long)ptep) & ~PAGE_MASK;
+    idx = offset / sizeof(pte_t);
 
     if (!READ_ONCE(pte_page->pt_replica)) {
-        /* No replicas path */
-        
         if (!mm || mm == &init_mm) {
-            if (pte_val(pteval) != 0) {
-                pr_warn("MITOSIS UNTRACKED: mm=%s, ptep=%px, page=%px, nid=%d, val=%lx\n",
-                        mm ? "init_mm" : "NULL", ptep, pte_page, 
-                        page_to_nid(pte_page), pte_val(pteval));
-                dump_stack();
-            }
             native_set_pte(ptep, pteval);
             return;
         }
         
-        /* Has valid mm - this path tracks */
         node = page_to_nid(pte_page);
         old_val = READ_ONCE(*ptep);
-        
-        /* DEBUG: Print for indices in the suspicious range */
-        {
-            unsigned long offset = ((unsigned long)ptep) & ~PAGE_MASK;
-            int idx = offset / sizeof(pte_t);
-            if (idx >= 250 && idx <= 280) {
-                pr_info("MITOSIS SET idx=%d: mm=%px, old=%lx, new=%lx, node=%d\n",
-                        idx, mm, pte_val(old_val), pte_val(pteval), node);
-            }
-        }
         
         native_set_pte(ptep, pteval);
         
@@ -765,13 +749,11 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
         return;
     }
 
-    /* HAS replicas path */
     if (pte_val(pteval) == 0)
         atomic_inc(&repl_pte_clears);
     else
         atomic_inc(&repl_pte_sets);
 
-    offset = ((unsigned long)ptep) & ~PAGE_MASK;
     start_page = pte_page;
     cur_page = pte_page;
 
