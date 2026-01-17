@@ -697,14 +697,6 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     pte_t old_val;
     int node;
     
-    static atomic_t with_replica_calls = ATOMIC_INIT(0);
-    static atomic_t with_replica_mm_null = ATOMIC_INIT(0);
-    static atomic_t with_replica_mm_init = ATOMIC_INIT(0);
-    static atomic_t with_replica_tracked = ATOMIC_INIT(0);
-    static atomic_t no_replica_calls = ATOMIC_INIT(0);
-    static atomic_t no_replica_mm_null = ATOMIC_INIT(0);
-    static atomic_t no_replica_tracked = ATOMIC_INIT(0);
-    
     if (!mitosis_tracking_initialized) {
         native_set_pte(ptep, pteval);
         return;
@@ -732,58 +724,48 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
 
     if (!READ_ONCE(pte_page->pt_replica)) {
         /* No replicas path */
-        int call_num = atomic_inc_return(&no_replica_calls);
         
         if (!mm || mm == &init_mm) {
-            atomic_inc(&no_replica_mm_null);
-        }
-        
-        if (mm && mm != &init_mm) {
-            node = page_to_nid(pte_page);
-            old_val = READ_ONCE(*ptep);
-            
-            native_set_pte(ptep, pteval);
-            
-            if (node >= 0 && node < NUMA_NODE_COUNT) {
-                bool was_populated = (pte_val(old_val) != 0);
-                bool is_populated = (pte_val(pteval) != 0);
-                
-                if (!was_populated && is_populated) {
-                    track_pte_entry(mm, node, true);
-                    atomic_inc(&no_replica_tracked);
-                } else if (was_populated && !is_populated) {
-                    track_pte_entry(mm, node, false);
-                }
+            if (pte_val(pteval) != 0) {
+                pr_warn("MITOSIS UNTRACKED: mm=%s, ptep=%px, page=%px, nid=%d, val=%lx\n",
+                        mm ? "init_mm" : "NULL", ptep, pte_page, 
+                        page_to_nid(pte_page), pte_val(pteval));
+                dump_stack();
             }
-        } else {
             native_set_pte(ptep, pteval);
+            return;
         }
         
-        if (call_num % 50000 == 0) {
-            pr_info("MITOSIS set_pte NO_REPLICA: calls=%d mm_null=%d tracked=%d\n",
-                    call_num, atomic_read(&no_replica_mm_null),
-                    atomic_read(&no_replica_tracked));
+        /* Has valid mm - this path tracks */
+        node = page_to_nid(pte_page);
+        old_val = READ_ONCE(*ptep);
+        
+        /* DEBUG: Print for indices in the suspicious range */
+        {
+            unsigned long offset = ((unsigned long)ptep) & ~PAGE_MASK;
+            int idx = offset / sizeof(pte_t);
+            if (idx >= 250 && idx <= 280) {
+                pr_info("MITOSIS SET idx=%d: mm=%px, old=%lx, new=%lx, node=%d\n",
+                        idx, mm, pte_val(old_val), pte_val(pteval), node);
+            }
+        }
+        
+        native_set_pte(ptep, pteval);
+        
+        if (node >= 0 && node < NUMA_NODE_COUNT) {
+            bool was_populated = (pte_val(old_val) != 0);
+            bool is_populated = (pte_val(pteval) != 0);
+            
+            if (!was_populated && is_populated) {
+                track_pte_entry(mm, node, true);
+            } else if (was_populated && !is_populated) {
+                track_pte_entry(mm, node, false);
+            }
         }
         return;
     }
 
     /* HAS replicas path */
-    {
-        int call_num = atomic_inc_return(&with_replica_calls);
-        
-        if (!mm)
-            atomic_inc(&with_replica_mm_null);
-        else if (mm == &init_mm)
-            atomic_inc(&with_replica_mm_init);
-
-        if (call_num % 50000 == 0) {
-            pr_info("MITOSIS set_pte WITH_REPLICA: calls=%d mm_null=%d mm_init=%d tracked=%d\n",
-                    call_num, atomic_read(&with_replica_mm_null),
-                    atomic_read(&with_replica_mm_init),
-                    atomic_read(&with_replica_tracked));
-        }
-    }
-
     if (pte_val(pteval) == 0)
         atomic_inc(&repl_pte_clears);
     else
@@ -806,7 +788,6 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
             
             if (!was_populated && is_populated) {
                 track_pte_entry(mm, cur_node, true);
-                atomic_inc(&with_replica_tracked);
             } else if (was_populated && !is_populated) {
                 track_pte_entry(mm, cur_node, false);
             }
@@ -1576,6 +1557,19 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
     if (strcmp(level_name, "pte") == 0) {
         pte_t *src_pte = (pte_t *)src;
         num_entries = PTRS_PER_PTE;
+        
+            /* DEBUG: Count primary entries that should already be tracked */
+        {
+            int primary_nid = page_to_nid(pages[0]);
+            s64 tracked_count = atomic64_read(&mm->pgtable_entries_pte[primary_nid]);
+            int actual_in_primary = 0;
+            for (j = 0; j < num_entries; j++) {
+                if (pte_val(src_pte[j]) != 0)
+                    actual_in_primary++;
+            }
+            pr_info("MITOSIS DEBUG replicate_pte: primary_nid=%d tracked=%lld actual_in_primary=%d\n",
+                    primary_nid, tracked_count, actual_in_primary);
+        }
 
         for (i = 1; i < count; i++) {
             pte_t *dst_pte = (pte_t *)page_address(pages[i]);

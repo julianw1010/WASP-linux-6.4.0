@@ -112,13 +112,22 @@ static inline pgtable_t __pte_alloc_one(struct mm_struct *mm, gfp_t gfp)
     {
         int node = mitosis_alloc_pte_node(mm, numa_node_id());
 
-        /* Try cache first when in cache-only mode OR replication is enabled */
         if (mm && mm != &init_mm && 
             (mm->cache_only_mode || smp_load_acquire(&mm->repl_pgd_enabled))) {
             pte = mitosis_cache_pop(node, MITOSIS_CACHE_PTE);
             if (pte) {
+                /* DEBUG: Check if page is actually zeroed */
+                pte_t *entries = (pte_t *)page_address(pte);
+                int i;
+                for (i = 0; i < PTRS_PER_PTE; i++) {
+                    if (pte_val(entries[i]) != 0) {
+                        pr_err("MITOSIS BUG: cache returned non-zero PTE page! "
+                               "page=%px idx=%d val=%lx\n",
+                               pte, i, pte_val(entries[i]));
+                    }
+                }
+                
                 if (!pgtable_pte_page_ctor(pte)) {
-                    /* ctor failed, return to cache or free */
                     if (!mitosis_cache_push(pte, node, MITOSIS_CACHE_PTE))
                         __free_page(pte);
                     return NULL;
@@ -129,10 +138,23 @@ static inline pgtable_t __pte_alloc_one(struct mm_struct *mm, gfp_t gfp)
             }
         }
 
-        /* Cache miss or replication disabled - allocate normally */
         pte = alloc_pages_node(node, gfp, 0);
         if (!pte)
             return NULL;
+            
+        /* DEBUG: Check if fresh alloc is zeroed */
+        {
+            pte_t *entries = (pte_t *)page_address(pte);
+            int i;
+            for (i = 0; i < PTRS_PER_PTE; i++) {
+                if (pte_val(entries[i]) != 0) {
+                    pr_err("MITOSIS BUG: fresh alloc non-zero PTE page! "
+                           "page=%px idx=%d val=%lx\n",
+                           pte, i, pte_val(entries[i]));
+                }
+            }
+        }
+        
         if (!pgtable_pte_page_ctor(pte)) {
             __free_page(pte);
             return NULL;
@@ -149,7 +171,6 @@ static inline pgtable_t __pte_alloc_one(struct mm_struct *mm, gfp_t gfp)
         __free_page(pte);
         return NULL;
     }
-
     return pte;
 #endif
 }
