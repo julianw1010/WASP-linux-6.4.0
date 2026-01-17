@@ -221,6 +221,27 @@ walk_pud:
     pr_info("  TOTAL %10llu %10llu %+10lld\n",
             total_tracked, total_actual,
             (s64)total_actual - (s64)total_tracked);
+            
+    /* DEBUG: Show how many times track_pte_entry(increment=true) was called */
+    pr_info("MITOSIS DEBUG per-node:\n");
+for_each_online_node(node) {
+    if (node < NUMA_NODE_COUNT) {
+        s64 inc = atomic64_read(&mm->debug_pte_inc_per_node[node]);
+        s64 dec = atomic64_read(&mm->debug_pte_dec_per_node[node]);
+        s64 tracked = atomic64_read(&mm->pgtable_entries_pte[node]);
+        pr_info("  Node %d: inc=%lld dec=%lld net=%lld tracked=%lld actual=%llu\n",
+                node, inc, dec, inc - dec, tracked, actual_pte[node]);
+    }
+}
+
+{
+        extern atomic64_t debug_repl_should_track;
+        extern atomic64_t debug_repl_did_track;
+        pr_info("MITOSIS DEBUG: repl_should_track=%lld repl_did_track=%lld diff=%lld\n",
+                atomic64_read(&debug_repl_should_track),
+                atomic64_read(&debug_repl_did_track),
+                atomic64_read(&debug_repl_should_track) - atomic64_read(&debug_repl_did_track));
+    }
 
     if (total_actual != total_tracked && total_actual > 0) {
         s64 delta = (s64)total_actual - (s64)total_tracked;

@@ -612,6 +612,11 @@ struct mm_struct {
 		unsigned long task_size;	/* size of task vm space */
 		
 #ifdef CONFIG_PGTABLE_REPLICATION
+                atomic64_t debug_pte_inc_per_node[NUMA_NODE_COUNT];
+                atomic64_t debug_pte_dec_per_node[NUMA_NODE_COUNT];
+                atomic64_t debug_track_pte_inc_calls;
+                atomic64_t debug_track_pte_dec_calls;
+                atomic64_t debug_native_set_pte_calls;
 		bool repl_pgd_enabled;           /* Is replication active for this mm? */
 		bool repl_in_progress;           /* Replication operation in progress */
 		bool repl_pending_enable;        /* Pending enable after exec */

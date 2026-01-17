@@ -49,6 +49,11 @@ atomic_t repl_alloc_pte_success = ATOMIC_INIT(0);
 atomic_t repl_release_pte_calls = ATOMIC_INIT(0);
 atomic_t repl_release_pte_freed = ATOMIC_INIT(0);
 
+atomic64_t debug_repl_should_track = ATOMIC_INIT(0);
+atomic64_t debug_repl_did_track = ATOMIC_INIT(0);
+EXPORT_SYMBOL(debug_repl_should_track);
+EXPORT_SYMBOL(debug_repl_did_track);
+
 /* Mitosis page table page cache - one per NUMA node */
 struct mitosis_cache_head mitosis_cache[NUMA_NODE_COUNT];
 EXPORT_SYMBOL(mitosis_cache);
@@ -322,12 +327,23 @@ static inline void track_entry_count_change(struct mm_struct *mm, int node,
  */
 static inline void track_pte_entry(struct mm_struct *mm, int node, bool is_increment)
 {
-	if (!mitosis_tracking_initialized)
-		return;
-	if (!mm || mm == &init_mm)
-		return;
-	track_entry_count_change(mm, node, &mm->pgtable_entries_pte[node],
-	                         &mm->pgtable_max_entries_pte[node], is_increment);
+    if (!mitosis_tracking_initialized)
+        return;
+    if (!mm || mm == &init_mm)
+        return;
+    if (node < 0 || node >= NUMA_NODE_COUNT)
+        return;
+    
+    if (is_increment) {
+        atomic64_inc(&mm->debug_track_pte_inc_calls);
+        atomic64_inc(&mm->debug_pte_inc_per_node[node]);
+    } else {
+        atomic64_inc(&mm->debug_track_pte_dec_calls);
+        atomic64_inc(&mm->debug_pte_dec_per_node[node]);
+    }
+    
+    track_entry_count_change(mm, node, &mm->pgtable_entries_pte[node],
+                             &mm->pgtable_max_entries_pte[node], is_increment);
 }
 
 /*
@@ -734,6 +750,7 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
         node = page_to_nid(pte_page);
         old_val = READ_ONCE(*ptep);
         
+        atomic64_inc(&mm->debug_native_set_pte_calls);
         native_set_pte(ptep, pteval);
         
         if (node >= 0 && node < NUMA_NODE_COUNT) {
@@ -764,11 +781,15 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
         
         WRITE_ONCE(*replica_entry, pteval);
         
+        if (pte_val(pteval) != 0)
+            atomic64_inc(&debug_repl_should_track);
+        
         if (mm && mm != &init_mm && cur_node >= 0 && cur_node < NUMA_NODE_COUNT) {
             bool was_populated = (pte_val(old_entry) != 0);
             bool is_populated = (pte_val(pteval) != 0);
             
             if (!was_populated && is_populated) {
+                atomic64_inc(&debug_repl_did_track);
                 track_pte_entry(mm, cur_node, true);
             } else if (was_populated && !is_populated) {
                 track_pte_entry(mm, cur_node, false);
@@ -1540,17 +1561,17 @@ static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
         pte_t *src_pte = (pte_t *)src;
         num_entries = PTRS_PER_PTE;
         
-            /* DEBUG: Count primary entries that should already be tracked */
+        /* DEBUG: Count entries in primary that should have been tracked earlier */
         {
             int primary_nid = page_to_nid(pages[0]);
-            s64 tracked_count = atomic64_read(&mm->pgtable_entries_pte[primary_nid]);
             int actual_in_primary = 0;
             for (j = 0; j < num_entries; j++) {
                 if (pte_val(src_pte[j]) != 0)
                     actual_in_primary++;
             }
-            pr_info("MITOSIS DEBUG replicate_pte: primary_nid=%d tracked=%lld actual_in_primary=%d\n",
-                    primary_nid, tracked_count, actual_in_primary);
+            pr_info("MITOSIS REPL_COPY: primary_nid=%d entries_in_page=%d tracked_on_node=%lld\n",
+                    primary_nid, actual_in_primary,
+                    atomic64_read(&mm->pgtable_entries_pte[primary_nid]));
         }
 
         for (i = 1; i < count; i++) {
@@ -2318,7 +2339,8 @@ void pgtable_repl_alloc_pte(struct mm_struct *mm, unsigned long pfn)
     struct page *pages[NUMA_NODE_COUNT];
     void *src_addr;
     int count = 0;
-    int i, ret;
+    int i, j, ret;
+    int entries_copied = 0;
 
     if (!mm || !pfn_valid(pfn))
         return;
@@ -2337,10 +2359,25 @@ void pgtable_repl_alloc_pte(struct mm_struct *mm, unsigned long pfn)
     if (ret != 0 || count < 2)
         return;
 
-    /* Just copy - entries will be tracked when set via set_pte() */
+    /* Copy to replicas AND track entries */
     for (i = 1; i < count; i++) {
-        memcpy(page_address(pages[i]), src_addr, PAGE_SIZE);
-        clflush_cache_range(page_address(pages[i]), PAGE_SIZE);
+        pte_t *src_pte = (pte_t *)src_addr;
+        pte_t *dst_pte = (pte_t *)page_address(pages[i]);
+        int nid = page_to_nid(pages[i]);
+        for (j = 0; j < PTRS_PER_PTE; j++) {
+            pte_t val = READ_ONCE(src_pte[j]);
+            WRITE_ONCE(dst_pte[j], val);
+            if (pte_val(val) != 0) {
+                track_pte_entry(mm, nid, true);
+                if (i == 1) entries_copied++;  /* Count once per entry */
+            }
+        }
+        clflush_cache_range(dst_pte, PAGE_SIZE);
+    }
+
+    if (entries_copied > 0) {
+        pr_info("MITOSIS ALLOC_PTE: copied %d entries from primary nid=%d\n",
+                entries_copied, page_to_nid(base_page));
     }
 
     BUG_ON(!smp_load_acquire(&mm->repl_pgd_enabled));

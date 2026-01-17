@@ -1335,8 +1335,13 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 		atomic64_set(&mm->pgtable_max_entries_pud[i], 0);
 		atomic64_set(&mm->pgtable_max_entries_p4d[i], 0);
 		atomic64_set(&mm->pgtable_max_entries_pgd[i], 0);
+		atomic64_set(&mm->debug_pte_inc_per_node[i], 0);
+                atomic64_set(&mm->debug_pte_dec_per_node[i], 0);
 	}
 	/* Initialize statistics fields */
+        atomic64_set(&mm->debug_track_pte_inc_calls, 0);
+        atomic64_set(&mm->debug_track_pte_dec_calls, 0);
+        atomic64_set(&mm->debug_native_set_pte_calls, 0);
 	atomic64_set(&mm->mitosis_tlb_shootdowns, 0);
 	atomic64_set(&mm->mitosis_tlb_ipis_sent, 0);
 	for (int i = 0; i < NUMA_NODE_COUNT; i++) {
